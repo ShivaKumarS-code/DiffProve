@@ -12,7 +12,7 @@ See [docs/architecture.md](docs/architecture.md) for the full system design and
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| 1 | GitHub App & webhook ingestion (HMAC verification, `queued` check runs, BullMQ queue) | in progress |
+| 1 | GitHub App & webhook ingestion (HMAC verification, `queued` check runs, BullMQ queue) | complete |
 | 2 | Diff splitter (test-only vs full patches) | pending |
 | 3 | E2B differential sandbox runner (Run A / Run B) | pending |
 | 4 | Verdict reporting & dashboard | pending |
@@ -33,6 +33,6 @@ Local dependencies (optional, for live BullMQ integration tests and dev runs):
 docker compose up -d redis
 ```
 
-Configuration is loaded from environment variables (`.env` supported) — see `.env.example`
-once Phase 1 config lands, and [docs/app-setup.md](docs/app-setup.md) for registering the
-GitHub App itself.
+Configuration is loaded from environment variables (`.env` supported) — copy `.env.example`
+to `.env`, and follow [docs/app-setup.md](docs/app-setup.md) to register the GitHub App itself
+(App ID, private key, webhook secret, and a local smoke test).
