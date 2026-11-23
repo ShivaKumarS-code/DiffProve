@@ -1,0 +1,19 @@
+{
+  "name": "DiffProve",
+  "description": "Differential PR verification: run new or changed tests against both the base commit (they must fail) and the head commit (they must pass).",
+  "url": "https://github.com/REPLACE-WITH-YOUR-ORG/diffprove",
+  "hook_attributes": {
+    "url": "https://REPLACE-WITH-YOUR-PUBLIC-HOST/webhooks/github",
+    "active": true
+  },
+  "public": false,
+  "default_events": [
+    "pull_request",
+    "installation"
+  ],
+  "default_permissions": {
+    "checks": "write",
+    "contents": "read",
+    "pull_requests": "read"
+  }
+}
