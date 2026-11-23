@@ -1,0 +1,14 @@
+# Local development dependencies.
+# The test suite does NOT require these services: Redis integration tests are
+# gated behind process.env.REDIS_URL and skip when it is unset.
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    command: ['redis-server', '--appendonly', 'yes']
+
+volumes:
+  redis-data:

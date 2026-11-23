@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: ['main', 'feature/**', 'phase-*/**']
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      # Lets the BullMQ integration tests (skipIf(!process.env.REDIS_URL)) run in CI.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit + integration tests
+        run: npm test
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+      - name: Smoke-start the built server (expect config failure exit)
+        run: |
+          set +e
+          node dist/server.js
+          status=$?
+          if [ $status -eq 0 ]; then
+            echo "server started without required config - unexpected"
+            exit 1
+          fi
+          echo "server refused to start without config (exit $status) - expected"
