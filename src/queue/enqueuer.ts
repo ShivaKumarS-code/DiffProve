@@ -19,7 +19,10 @@ import { Redis } from 'ioredis';
 
 import type { EnqueueResult, Enqueuer, VerificationJob } from '../domain.js';
 
-export const VERIFICATION_QUEUE_NAME = 'diffprove:verification';
+// BullMQ v6 rejects queue names containing ':' (it throws synchronously at
+// Queue construction, before any Redis connection), so the queue name uses a
+// dash-separated form.
+export const VERIFICATION_QUEUE_NAME = 'diffprove-verification';
 
 /** Deterministic, deduplicating job id: 'verify~<owner>~<repo>~<pr>~<headSha>'. */
 export function jobIdFor(job: VerificationJob): string {

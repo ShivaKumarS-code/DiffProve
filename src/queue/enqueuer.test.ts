@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Logger, VerificationJob, VerificationJobHandler } from '../domain.js';
-import { createEnqueuer, jobIdFor } from './enqueuer.js';
+import { createEnqueuer, jobIdFor, VERIFICATION_QUEUE_NAME } from './enqueuer.js';
 import { startWorker } from './worker.js';
 
 const sampleJob: VerificationJob = {
@@ -32,6 +32,15 @@ function fakeLogger(): Logger {
 function uniqueHeadSha(): string {
   return `sha-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
+
+describe('VERIFICATION_QUEUE_NAME', () => {
+  it('is safe for BullMQ v6, which rejects queue names containing ":"', () => {
+    // Regression guard: 'diffprove:verification' threw synchronously at Queue
+    // construction ("Queue name cannot contain :") and crashed server startup.
+    expect(VERIFICATION_QUEUE_NAME).toBe('diffprove-verification');
+    expect(VERIFICATION_QUEUE_NAME).not.toContain(':');
+  });
+});
 
 describe('jobIdFor', () => {
   it('builds the documented id for a nested repo name', () => {
