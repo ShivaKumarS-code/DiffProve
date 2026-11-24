@@ -37,7 +37,8 @@ import type {
 import { classifyRun } from '../runner/classify.js';
 import { buildInstallCommand, buildTestCommand, findLockfile } from '../runner/commands.js';
 import { detectRunner } from '../runner/detect.js';
-import { conclusionForVerdict, describeVerdict, verdictFrom } from '../runner/matrix.js';
+import { conclusionForVerdict, verdictFrom } from '../runner/matrix.js';
+import { buildVerdictReport } from '../runner/report.js';
 import type {
   DifferentialRawResult,
   DifferentialRunner,
@@ -279,7 +280,11 @@ export function createDifferentialHandler(
     const verdict = verdictFrom(outcomeA, outcomeB);
     const conclusion = conclusionForVerdict(verdict);
     const totalMs = raw.runA.durationMs + raw.runB.durationMs;
-    const { title, summary } = describeVerdict(verdict, outcomeA, outcomeB, totalMs);
+    const { title, summary } = buildVerdictReport(verdict, outcomeA, outcomeB, {
+      repoFullName,
+      prNumber,
+      durationMs: totalMs,
+    });
 
     logger.info(
       `verdict: ${verdict} (runA=${outcomeA.status}, runB=${outcomeB.status}, ${totalMs}ms)`,
@@ -290,10 +295,13 @@ export function createDifferentialHandler(
         repoFullName,
         headSha,
         installationId,
+        prNumber,
         verdict,
         conclusion,
         title,
         summary,
+        runA: outcomeA,
+        runB: outcomeB,
         durationMs: totalMs,
       });
     } catch (error) {

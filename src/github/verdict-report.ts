@@ -8,10 +8,11 @@
  * run is missing — posts a finished run through
  * `POST /repos/{owner}/{repo}/check-runs`.
  *
- * This is the BASIC Phase 3 completion: status/conclusion plus a plain
- * `output.title` / `output.summary` pair. The rich Markdown summary with clipped
- * Run A / Run B log excerpts is Phase 4; `durationMs` and `verdict` are carried
- * on the input so that renderer can use them without changing this port.
+ * The reporter is rendering-agnostic: the check run's `output.title` and
+ * `output.summary` are posted verbatim. Phase 4's structured Markdown
+ * (verdict statement, matrix row, Run A / Run B excerpts) is built by
+ * `src/runner/report.ts` (`buildVerdictReport`), so this port just carries the
+ * rendered pair — and, for later writers, the raw run outcomes on the input.
  */
 
 import type { Octokit } from '@octokit/core';
