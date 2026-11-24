@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+/*
+ * Component sources are pinned explicitly (paths are relative to this file) so
+ * class detection does not depend on Tailwind's automatic scan root, which can
+ * differ between `next dev` and `next build` inside a monorepo.
+ */
+@source "../app";
+@source "../components";
+
+/*
+ * Typography uses plain CSS font stacks on purpose: Next's Google-font loader
+ * fetches font files over the network at build time, which would make the
+ * dashboard build fail (or silently fall back) in offline and CI environments.
+ */
+:root {
+  color-scheme: dark;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  min-height: 100%;
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+/* Log output is rendered in <pre>; two-space tabs keep sandbox output aligned. */
+pre {
+  tab-size: 2;
+}

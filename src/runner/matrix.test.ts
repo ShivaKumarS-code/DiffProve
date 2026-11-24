@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { conclusionForVerdict, describeVerdict, verdictFrom } from './matrix.js';
+import { conclusionForVerdict, verdictFrom } from './matrix.js';
 import type { RunStatus, SandboxRunOutcome, Verdict } from './types.js';
 
 /** Classified outcome with a plausible exit code for the status. */
@@ -99,75 +99,5 @@ describe('conclusionForVerdict', () => {
     for (const [verdict, conclusion] of CASES) {
       expect(conclusionForVerdict(verdict)).toBe(conclusion);
     }
-  });
-});
-
-describe('describeVerdict — titles and summaries', () => {
-  it('describes verified-fix with Run B and total durations', () => {
-    expect(describeVerdict('verified-fix', outcome('fail', 800), outcome('pass', 1200), 2500)).toEqual(
-      {
-        title: 'Differential verification passed',
-        summary:
-          'Run A (base + new tests) failed as expected; Run B (head + new tests) passed in 1.2s. The new tests reproduce the PR change. Total: 2.5s.',
-      },
-    );
-  });
-
-  it('describes weak-test with the total duration', () => {
-    expect(
-      describeVerdict('weak-test', outcome('pass', 1000), outcome('pass', 1200), 2500),
-    ).toEqual({
-      title: 'Weak or non-reproducing test detected',
-      summary:
-        'Run A (base + new tests) passed — the new tests did not fail on the base commit; Run B passed as well. The tests do not verify the PR change. Total: 2.5s.',
-    });
-  });
-
-  it('describes broken-implementation with Run B and total durations', () => {
-    expect(
-      describeVerdict('broken-implementation', outcome('fail', 700), outcome('fail', 3000), 5000),
-    ).toEqual({
-      title: 'Implementation fails its own tests',
-      summary:
-        'Run A failed as expected, but Run B (head + new tests) also failed in 3.0s. Total: 5.0s.',
-    });
-  });
-
-  it('describes new-symbol with Run B and total durations', () => {
-    expect(
-      describeVerdict('new-symbol', outcome('import-error', 600), outcome('pass', 500), 1000),
-    ).toEqual({
-      title: 'New feature test (base import/syntax error)',
-      summary:
-        'Run A failed with an import or syntax error (expected for newly introduced symbols), and Run B passed in 0.5s. Total: 1.0s.',
-    });
-  });
-
-  it('describes environment-failure with both statuses', () => {
-    expect(
-      describeVerdict('environment-failure', outcome('timeout'), outcome('fail'), 2500),
-    ).toEqual({
-      title: 'Sandbox environment failure',
-      summary:
-        'Run A/B could not be executed reliably (status: timeout/fail). This is not a verdict on the PR itself. Total: 2.5s.',
-    });
-  });
-
-  it('rounds durations to one decimal of a second', () => {
-    const { summary } = describeVerdict(
-      'verified-fix',
-      outcome('fail', 0),
-      outcome('pass', 1499),
-      1049,
-    );
-    expect(summary).toContain('passed in 1.5s');
-    expect(summary).toContain('Total: 1.0s');
-  });
-
-  it('renders zero durations as 0.0s rather than NaN', () => {
-    const { summary } = describeVerdict('verified-fix', outcome('fail', 0), outcome('pass', 0), 0);
-    expect(summary).toContain('passed in 0.0s');
-    expect(summary).toContain('Total: 0.0s');
-    expect(summary).not.toContain('NaN');
   });
 });

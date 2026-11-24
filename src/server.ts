@@ -6,18 +6,25 @@
  * clients, the Octokit transport, Fastify). `src/app.ts` stays injected so it
  * can be tested without any of it.
  *
- * Phase 1 + 2 + 3 scope (architecture, "End-to-End Verification Pipeline"
- * steps 1-6): accept verified webhooks, post a `queued` check run, split each
- * PR's diff, and — for PRs with test changes — run the differential (Run A
- * base + Test-Only Patch, Run B head + Full PR Patch) in an E2B sandbox with
- * egress locked down, then complete the check run with the mapped verdict.
- * PRs without test changes short-circuit to `neutral` as before.
+ * Phase 1-4 scope (architecture, "End-to-End Verification Pipeline" steps 1-6):
+ * accept verified webhooks, post a `queued` check run, split each PR's diff,
+ * run the differential (Run A base + Test-Only Patch, Run B head + Full PR
+ * Patch) in an E2B sandbox with egress locked down, complete the check run
+ * with the rich Markdown verdict report, and persist runs + repo config to
+ * PostgreSQL for the dashboard. PRs without test changes short-circuit to
+ * `neutral` as before.
  */
 
 import 'dotenv/config';
 
 import { buildApp } from './app.js';
 import { ConfigError, loadConfig, type AppConfig } from './config.js';
+import { createInstallationStore } from './db/installations.js';
+import { runMigrations } from './db/migrate.js';
+import { createPgPool } from './db/pool.js';
+import { createRepoConfigLookup, createRepositoryStore } from './db/repositories.js';
+import type { InstallationStore, RepositoryStore, VerificationRunStore } from './db/types.js';
+import { createVerificationRunStore } from './db/verification-runs.js';
 import { createCheckRunPoster } from './github/checks.js';
 import { createCheckRunReporter } from './github/check-runs.js';
 import { createAppAuthenticator, createOctokit } from './github/octokit.js';
@@ -61,6 +68,23 @@ async function main(): Promise<void> {
   // Real ports. Nothing below logs a config value.
   const enqueuer = createEnqueuer(config.redisUrl);
 
+  // Phase 4 run-history database (optional): without DATABASE_URL the API
+  // answers 503, installation events are only logged, and verification runs
+  // are not persisted. With it, migrations run at boot — a reachable database
+  // is a hard requirement then, and an outage fails fast like any other
+  // invalid configuration.
+  const dbPool = config.databaseUrl === null ? null : createPgPool(config.databaseUrl);
+  let repositories: RepositoryStore | null = null;
+  let runsStore: VerificationRunStore | null = null;
+  let installationStore: InstallationStore | null = null;
+  if (dbPool !== null) {
+    await runMigrations(dbPool);
+    repositories = createRepositoryStore(dbPool);
+    runsStore = createVerificationRunStore(dbPool, repositories);
+    installationStore = createInstallationStore(dbPool);
+  }
+  const repoConfig = repositories === null ? null : createRepoConfigLookup(repositories);
+
   // One shared auth-less transport + authenticator backs every GitHub call:
   // the queued-check-run poster, the diff/report clients, and the Phase 3
   // repo-content, tarball, and verdict reporters.
@@ -73,6 +97,8 @@ async function main(): Promise<void> {
     enqueuer,
     checkPoster,
     logLevel: config.logLevel,
+    api: repositories !== null && runsStore !== null ? { repositories, runs: runsStore } : null,
+    installations: installationStore,
   });
 
   // Phase 3 differential runner. Without an E2B_API_KEY there is no sandbox, so
@@ -102,6 +128,8 @@ async function main(): Promise<void> {
       checkRuns: createCheckRunReporter(octokit, authenticator),
       repoContent: createRepoContentClient(octokit, authenticator),
       repoTarball: createRepoTarballClient(octokit, authenticator),
+      repoConfig,
+      runs: runsStore,
       runner,
       verdicts: createVerdictReporter(octokit, authenticator),
       logger: app.log,
@@ -125,13 +153,17 @@ async function main(): Promise<void> {
 
     // Order matters: stop consuming jobs first so no handler starts mid-teardown,
     // then release the snapshot-cache Redis client (worker side only), then the
-    // enqueuer's, then close the HTTP server.
+    // enqueuer's, then close the HTTP server, and finally the database pool
+    // (nothing queries it once the API routes are gone).
     await worker.close();
     if (snapshotKv !== null) {
       await snapshotKv.close();
     }
     await enqueuer.close();
     await app.close();
+    if (dbPool !== null) {
+      await dbPool.close();
+    }
 
     // Forced exit guarantees no lingering handle keeps the process alive even if
     // a library connection is left behind; the queue's own close() already quit

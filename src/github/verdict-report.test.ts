@@ -1,18 +1,37 @@
 import type { Octokit } from '@octokit/core';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { VerdictReportInput } from '../runner/types.js';
+import type { SandboxRunOutcome, VerdictReportInput } from '../runner/types.js';
 import { CHECK_RUN_NAME } from './checks.js';
 import { createVerdictReporter } from './verdict-report.js';
+
+const RUN_A: SandboxRunOutcome = {
+  status: 'fail',
+  exitCode: 1,
+  durationMs: 400,
+  logExcerpt: 'FAILED tests/test_total.py::test_total - AssertionError: 3 != 4',
+};
+
+const RUN_B: SandboxRunOutcome = {
+  status: 'pass',
+  exitCode: 0,
+  durationMs: 800,
+  logExcerpt: '1 passed in 0.42s',
+};
 
 const REPORT: VerdictReportInput = {
   repoFullName: 'octocat/hello-world',
   headSha: 'head456',
   installationId: 42,
+  prNumber: 7,
   verdict: 'verified-fix',
   conclusion: 'success',
   title: 'Differential verification passed',
-  summary: 'Run A failed as expected; Run B passed. Verdict: verified-fix.',
+  summary:
+    '**Verified fix** — Run A failed on the base commit as expected and Run B passes on head.\n\n' +
+    '| Run A (base + new tests) | Run B (head + new tests) | Verdict |',
+  runA: RUN_A,
+  runB: RUN_B,
   durationMs: 1234,
 };
 
@@ -105,8 +124,8 @@ describe('createVerdictReporter', () => {
     });
     // Report fields flow through untouched ("API & Interface Contracts").
     expect(patchParameters.output).toEqual({
-      title: 'Differential verification passed',
-      summary: 'Run A failed as expected; Run B passed. Verdict: verified-fix.',
+      title: REPORT.title,
+      summary: REPORT.summary,
     });
   });
 
@@ -140,8 +159,8 @@ describe('createVerdictReporter', () => {
       headers: { authorization: 'token ghs_x' },
     });
     expect(createParameters.output).toEqual({
-      title: 'Differential verification passed',
-      summary: 'Run A failed as expected; Run B passed. Verdict: verified-fix.',
+      title: REPORT.title,
+      summary: REPORT.summary,
     });
   });
 

@@ -4,7 +4,8 @@
  * Everything cross-piece lives here so the pieces can be built and tested in
  * parallel against a stable contract:
  *  - `src/runner/detect.ts`, `classify.ts`, `commands.ts`, `matrix.ts` hold the
- *    pure differential policy (detection, classification, verdict matrix).
+ *    pure differential policy (detection, classification, verdict matrix);
+ *    `src/runner/report.ts` renders that verdict as Markdown for GitHub.
  *  - `src/runner/e2b-runner.ts` implements `DifferentialRunner` and returns
  *    only RAW results; classification happens in the pure core, so the
  *    policy is fully unit-testable without any sandbox.
@@ -178,16 +179,29 @@ export type RepoTarballClient = (input: {
   installationId: number;
 }) => Promise<Uint8Array>;
 
-/** Everything the basic (Phase 3) check-run completion needs. */
+/**
+ * Everything the check-run completion needs.
+ *
+ * `title` and `summary` are now Markdown built by `src/runner/report.ts`
+ * (`buildVerdictReport`) and posted verbatim; GitHub renders the check run's
+ * output as Markdown.
+ */
 export interface VerdictReportInput {
   repoFullName: string;
   headSha: string;
   installationId: number;
+  prNumber: number;
   verdict: Verdict;
   /** GitHub check run conclusion: success | failure | neutral (matrix column 4). */
   conclusion: 'success' | 'failure' | 'neutral';
+  /** Markdown check-run title, built by `src/runner/report.ts`. */
   title: string;
+  /** Markdown check-run summary, built by `src/runner/report.ts`. */
   summary: string;
+  /** Run A's classified outcome (log excerpt feeds the report). */
+  runA: SandboxRunOutcome;
+  /** Run B's classified outcome (log excerpt feeds the report). */
+  runB: SandboxRunOutcome;
   durationMs: number;
 }
 

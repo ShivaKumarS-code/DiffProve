@@ -4,15 +4,25 @@
  * docs/architecture.md, "End-to-End Verification Pipeline" steps 2-6: the
  * worker fetches and splits the PR diff, provisions the sandbox, runs Run A
  * (base + Test-Only Patch) and Run B (base + Full PR Patch), maps the outcome
- * through the verdict matrix, and completes the Check Run. Phase 3 reporting is
- * deliberately basic (conclusion + plain title/summary); the rich Markdown
- * reports are Phase 4.
+ * through the verdict matrix, completes the Check Run with the rich Markdown
+ * report, and records the run for the dashboard.
+ *
+ * Phase 4 adds the two database-backed behaviors (architecture, "Core Data
+ * Model" and "API & Interface Contracts"):
+ *  - the repo's configuration is consulted *before* the diff is fetched, so a
+ *    repo whose `enabled` flag is off leaves its job queued, and its
+ *    `test_file_globs` / `test_command` overrides (`PATCH
+ *    /api/repos/:id/config`) replace the auto-detected defaults;
+ *  - after GitHub accepted the verdict, the run is persisted
+ *    (`VerificationRunStore`), because the architecture's step 6 says the worker
+ *    "saves the record to PostgreSQL" once the check run is updated.
  *
  * This handler is the composition point: every collaborator is injected as a
  * port (`PrDiffClient`, `CheckRunReporter`, `RepoContentClient`,
- * `RepoTarballClient`, `DifferentialRunner`, `VerdictReporter`), so the queue
- * layer stays free of Octokit and E2B, and the whole pipeline is unit-testable
- * with canned diffs and fake sandbox results.
+ * `RepoTarballClient`, `DifferentialRunner`, `VerdictReporter`,
+ * `RepoConfigStore`, `VerificationRunStore`), so the queue layer stays free of
+ * Octokit, E2B, and Postgres, and the whole pipeline is unit-testable with
+ * canned diffs and fake sandbox results.
  *
  * Failure policy (Phase 2's, kept): a port failure is logged and rethrown so
  * BullMQ retries it; nothing is ever reported as a verdict that was not
@@ -25,6 +35,7 @@
 
 import { createHash } from 'node:crypto';
 
+import type { RepoConfigStore, VerificationRunStore } from '../db/types.js';
 import type { Logger, VerificationJob, VerificationJobHandler } from '../domain.js';
 import { splitDiff } from '../diff/split.js';
 import { DEFAULT_TEST_GLOBS, NO_TEST_CHANGES_TITLE } from '../diff/types.js';
@@ -37,7 +48,8 @@ import type {
 import { classifyRun } from '../runner/classify.js';
 import { buildInstallCommand, buildTestCommand, findLockfile } from '../runner/commands.js';
 import { detectRunner } from '../runner/detect.js';
-import { conclusionForVerdict, describeVerdict, verdictFrom } from '../runner/matrix.js';
+import { conclusionForVerdict, verdictFrom } from '../runner/matrix.js';
+import { buildVerdictReport } from '../runner/report.js';
 import type {
   DifferentialRawResult,
   DifferentialRunner,
@@ -54,6 +66,14 @@ export interface DifferentialHandlerDeps {
   /** The E2B differential runner; null when E2B is not configured (E2B_API_KEY unset) — jobs are then left queued. */
   runner: DifferentialRunner | null;
   verdicts: VerdictReporter;
+  /**
+   * Worker-facing repository config (architecture pipeline step 2: "repo-configured
+   * test globs"). Null when PostgreSQL is not configured: the diff is then split
+   * with the default globs and the repo is treated as enabled.
+   */
+  repoConfig: RepoConfigStore | null;
+  /** Run-history persistence; null when PostgreSQL is not configured (runs are then not recorded). */
+  runs: VerificationRunStore | null;
   logger: Logger;
 }
 
@@ -66,11 +86,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Check-run summary explaining why differential verification was skipped. */
-function buildNoTestChangesSummary(split: SplitResult): string {
+/**
+ * Check-run summary explaining why differential verification was skipped.
+ *
+ * `testGlobs` is the resolved list that was actually applied — a repo-configured
+ * override, or the defaults — so the explanation never names globs the split was
+ * not performed with.
+ */
+function buildNoTestChangesSummary(split: SplitResult, testGlobs: readonly string[]): string {
   return (
     `${split.files.length} changed file(s), none matching the test file globs ` +
-    `(${DEFAULT_TEST_GLOBS.join(', ')}). Differential verification skipped: ` +
+    `(${testGlobs.join(', ')}). Differential verification skipped: ` +
     `no new or modified tests to verify.`
   );
 }
@@ -84,14 +110,16 @@ function sha256Hex(content: string): string {
 }
 
 /**
- * Builds the Phase-3 `VerificationJobHandler`: fetch and split the PR diff,
- * short-circuit PRs without test changes to `neutral`, then run the base and
- * head differential in the sandbox and report the mapped verdict.
+ * Builds the `VerificationJobHandler` for the differential pipeline: honor the
+ * repo's config (enabled flag, test globs, test command), fetch and split the PR
+ * diff, short-circuit PRs without test changes to `neutral`, run the base and
+ * head differential in the sandbox, report the mapped verdict, and persist the
+ * run for the dashboard.
  */
 export function createDifferentialHandler(
   deps: DifferentialHandlerDeps,
 ): VerificationJobHandler {
-  const { prDiff, checkRuns, repoContent, repoTarball, runner, verdicts, logger } = deps;
+  const { prDiff, checkRuns, repoContent, repoTarball, runner, verdicts, runs, logger } = deps;
 
   return async (job: VerificationJob): Promise<void> => {
     const { repoFullName, prNumber, baseSha, headSha } = job;
@@ -112,6 +140,24 @@ export function createDifferentialHandler(
       `verification job received: repo=${repoFullName} pr=${prNumber} head=${headSha} (differential pipeline)`,
     );
 
+    // Phase 4: the repository's own configuration replaces the hard-coded
+    // defaults (architecture pipeline step 2, "repo-configured test globs"). It
+    // is read BEFORE the diff so a disabled repo never touches GitHub at all.
+    const repoConfig = deps.repoConfig
+      ? await deps.repoConfig.lookupConfig(repoFullName)
+      : null;
+
+    if (repoConfig !== null && !repoConfig.enabled) {
+      // "Core Data Model", `repositories.enabled`: the owner turned verification
+      // off for this repo, so the job stays queued — nothing is executed,
+      // reported, or persisted.
+      logger.warn(
+        `verification is disabled for repo=${repoFullName} (repositories.enabled = false); ` +
+          `leaving the check run queued for ${repoFullName}#${prNumber}`,
+      );
+      return;
+    }
+
     let diff: string;
     try {
       diff = await prDiff({ repoFullName, baseSha, headSha, installationId });
@@ -125,7 +171,12 @@ export function createDifferentialHandler(
       throw error;
     }
 
-    const split = splitDiff(diff);
+    // Repo-configured globs replace the defaults entirely; undefined keeps them
+    // (src/diff/split.ts documents the replacement semantics).
+    const globs = repoConfig?.testFileGlobs ?? undefined;
+    const split = splitDiff(diff, globs);
+    // The skip summary must name exactly the globs this split used.
+    const appliedGlobs = globs ?? DEFAULT_TEST_GLOBS;
 
     logger.info(
       `split: ${split.files.length} file(s) changed, ` +
@@ -142,7 +193,7 @@ export function createDifferentialHandler(
         headSha,
         installationId,
         title: NO_TEST_CHANGES_TITLE,
-        summary: buildNoTestChangesSummary(split),
+        summary: buildNoTestChangesSummary(split, appliedGlobs),
       };
 
       try {
@@ -212,7 +263,11 @@ export function createDifferentialHandler(
     // The install command describes the BASE state; the test command is the
     // same targeted invocation for Run A and Run B (pipeline steps 4-5).
     const installCommand = buildInstallCommand(baseFiles, detected.kind);
-    const testCommand = buildTestCommand(detected.kind, split.runnableTestFiles);
+    // Architecture "API & Interface Contracts": PATCH /api/repos/:id/config
+    // overrides the auto-detected `test_command`, so a repo-configured command
+    // wins over the one built from the runner kind and changed test files.
+    const testCommand =
+      repoConfig?.testCommand ?? buildTestCommand(detected.kind, split.runnableTestFiles);
 
     // Snapshot key from the base lockfile, and a second key for head: Run B
     // must reinstall only when the PR changes dependencies (guardrail #4).
@@ -279,7 +334,11 @@ export function createDifferentialHandler(
     const verdict = verdictFrom(outcomeA, outcomeB);
     const conclusion = conclusionForVerdict(verdict);
     const totalMs = raw.runA.durationMs + raw.runB.durationMs;
-    const { title, summary } = describeVerdict(verdict, outcomeA, outcomeB, totalMs);
+    const { title, summary } = buildVerdictReport(verdict, outcomeA, outcomeB, {
+      repoFullName,
+      prNumber,
+      durationMs: totalMs,
+    });
 
     logger.info(
       `verdict: ${verdict} (runA=${outcomeA.status}, runB=${outcomeB.status}, ${totalMs}ms)`,
@@ -290,10 +349,13 @@ export function createDifferentialHandler(
         repoFullName,
         headSha,
         installationId,
+        prNumber,
         verdict,
         conclusion,
         title,
         summary,
+        runA: outcomeA,
+        runB: outcomeB,
         durationMs: totalMs,
       });
     } catch (error) {
@@ -303,6 +365,40 @@ export function createDifferentialHandler(
       // Rethrowing lets BullMQ retry. Re-completing a check run with the same
       // conclusion/title/summary is idempotent.
       throw error;
+    }
+
+    // Architecture pipeline step 6: the worker "saves the record to PostgreSQL"
+    // after it updated the check run. Persisting only a reported verdict keeps
+    // history free of runs GitHub was never told about.
+    //
+    // Accepted edge: `insertRun` has no natural key in v1, so when persistence
+    // fails *after* the (idempotent) GitHub report succeeded, the BullMQ retry
+    // re-runs the pipeline and may insert a duplicate run row.
+    if (runs !== null) {
+      try {
+        await runs.insertRun({
+          repoFullName,
+          installationId,
+          language: detected.kind === 'pytest' ? 'python' : 'node',
+          prNumber,
+          baseSha,
+          headSha,
+          changedTestFiles: split.changedTestFiles,
+          runAStatus: outcomeA.status,
+          runBStatus: outcomeB.status,
+          verdict,
+          durationMs: totalMs,
+          runALog: outcomeA.logExcerpt,
+          runBLog: outcomeB.logExcerpt,
+        });
+      } catch (error) {
+        logger.error(
+          `failed to persist verification run for ${repoFullName}#${prNumber}: ${errorMessage(error)}`,
+        );
+        // Rethrowing fails the job so BullMQ retries; re-reporting the same
+        // verdict to GitHub is idempotent, so only the row can be duplicated.
+        throw error;
+      }
     }
 
     logger.info(`reported verdict ${verdict} for ${repoFullName}#${prNumber}`);

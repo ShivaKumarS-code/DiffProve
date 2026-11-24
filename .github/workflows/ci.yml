@@ -19,14 +19,30 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      # Lets the PostgreSQL integration tests (skipIf(!process.env.DATABASE_URL)) run in CI.
+      postgres:
+        image: postgres:16-alpine
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_USER: diffprove
+          POSTGRES_PASSWORD: diffprove
+          POSTGRES_DB: diffprove
+        options: >-
+          --health-cmd "pg_isready -U diffprove -d diffprove"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       REDIS_URL: redis://127.0.0.1:6379
+      DATABASE_URL: postgres://diffprove:diffprove@127.0.0.1:5432/diffprove
+      NEXT_TELEMETRY_DISABLED: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Install dependencies
+      - name: Install dependencies (root + workspace)
         run: npm ci
       - name: Typecheck
         run: npm run typecheck
@@ -34,8 +50,10 @@ jobs:
         run: npm test
       - name: Lint
         run: npm run lint
-      - name: Build
+      - name: Build service
         run: npm run build
+      - name: Build dashboard
+        run: npm run build:web
       - name: Smoke-start the built server (expect config failure exit)
         run: |
           set +e

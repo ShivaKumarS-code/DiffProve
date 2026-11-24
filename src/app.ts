@@ -14,6 +14,8 @@
 
 import Fastify, { type FastifyInstance } from 'fastify';
 
+import { registerApiRoutes, type ApiDeps } from './api/routes.js';
+import type { InstallationStore } from './db/types.js';
 import type { CheckRunPoster, Enqueuer } from './domain.js';
 import { parseWebhookEvent } from './webhooks/events.js';
 import { handleWebhookEvent } from './webhooks/handle-event.js';
@@ -35,6 +37,19 @@ export interface AppDeps {
   webhookSecret: string;
   enqueuer: Enqueuer;
   checkPoster: CheckRunPoster;
+  /**
+   * Dashboard API stores (`GET /api/repos`, `GET /api/repos/:id/runs`,
+   * `PATCH /api/repos/:id/config`). Omitted or null when `DATABASE_URL` is not
+   * configured, in which case those routes answer 503 instead of pretending
+   * (architecture, "API & Interface Contracts").
+   */
+  api?: ApiDeps | null;
+  /**
+   * Installation persistence for `installation` webhook events. Omitted or
+   * null when the database is not configured; the webhook handler degrades to
+   * acknowledgement-only behavior.
+   */
+  installations?: InstallationStore | null;
   /** Pino log level; default 'info'. */
   logLevel?: string;
 }
@@ -116,6 +131,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       const result = await handleWebhookEvent(parsed, {
         enqueuer: deps.enqueuer,
         checkPoster: deps.checkPoster,
+        installations: deps.installations ?? null,
         logger: app.log,
       });
 
@@ -134,6 +150,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       return reply.code(INTERNAL_ERROR_STATUS).send({ message: 'internal error' });
     }
   });
+
+  // Dashboard API (docs/architecture.md, "API & Interface Contracts":
+  // `GET /api/repos/:id/runs` and `PATCH /api/repos/:id/config`). A null dep
+  // means persistence is not configured and each route answers 503.
+  registerApiRoutes(app, deps.api ?? null);
 
   return app;
 }

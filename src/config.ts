@@ -10,15 +10,24 @@
  * Security (architecture guardrail #2): secrets must never be logged or
  * leaked. Consequently the error messages below name the offending variable
  * but never echo its value for `GITHUB_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`,
- * `E2B_API_KEY`, or `REDIS_URL` (the latter may embed credentials). Only
- * non-secret, enumerated values such as `PORT`, `LOG_LEVEL`, and the E2B
- * timeouts are quoted back.
+ * `E2B_API_KEY`, `REDIS_URL`, or `DATABASE_URL` (the last two may embed
+ * credentials). Only non-secret, enumerated values such as `PORT`, `LOG_LEVEL`,
+ * and the E2B timeouts are quoted back.
  */
 
 /** Validated runtime configuration for the GitHub App server. */
 export interface AppConfig {
   port: number;
   redisUrl: string;
+  /**
+   * PostgreSQL connection string, e.g.
+   * `postgresql://diffprove:diffprove@127.0.0.1:5432/diffprove`.
+   *
+   * Null when unset: installations, repo config overrides, and run history are
+   * then disabled — the API answers 503 and verification runs are not
+   * persisted. May embed credentials — never echoed in errors or logs.
+   */
+  databaseUrl: string | null;
   /** Numeric GitHub App id, e.g. "123456" (kept as a string to avoid precision loss). */
   githubAppId: string;
   /** PEM text with real newlines, ready to hand to `@octokit/auth-app`. */
@@ -70,6 +79,9 @@ const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
 /** Accepted Redis URI schemes (plaintext and TLS). */
 const REDIS_URL_SCHEMES = ['redis://', 'rediss://'] as const;
 
+/** Accepted PostgreSQL URI schemes. */
+const DATABASE_URL_SCHEMES = ['postgres://', 'postgresql://'] as const;
+
 const DIGITS_ONLY = /^\d+$/;
 
 /**
@@ -114,6 +126,23 @@ function parseRedisUrl(value: string | undefined, problems: string[]): string {
       'REDIS_URL: must start with "redis://" or "rediss://"',
     );
     return DEFAULT_REDIS_URL;
+  }
+  return value;
+}
+
+function parseDatabaseUrl(
+  value: string | undefined,
+  problems: string[],
+): string | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!DATABASE_URL_SCHEMES.some((scheme) => value.startsWith(scheme))) {
+    // Do not echo the value: a PostgreSQL URL usually embeds the password.
+    problems.push(
+      'DATABASE_URL: must start with "postgres://" or "postgresql://"',
+    );
+    return null;
   }
   return value;
 }
@@ -256,8 +285,9 @@ function parseTimeoutMs(
  * Validate an environment bag and return a frozen-by-convention `AppConfig`.
  *
  * Defaults: `PORT=3000`, `REDIS_URL=redis://127.0.0.1:6379` (matches
- * `docker compose up -d redis`), `LOG_LEVEL=info`, no E2B API key or template
- * (sandbox execution disabled), `E2B_TEST_TIMEOUT_MS=120000`,
+ * `docker compose up -d redis`), no `DATABASE_URL` (run history, repo config,
+ * and installation persistence disabled), `LOG_LEVEL=info`, no E2B API key or
+ * template (sandbox execution disabled), `E2B_TEST_TIMEOUT_MS=120000`,
  * `E2B_INSTALL_TIMEOUT_MS=240000`.
  *
  * @throws {ConfigError} listing every missing or invalid variable at once.
@@ -269,6 +299,12 @@ export function loadConfig(
 
   const port = parsePort(readValue(env, 'PORT'), problems);
   const redisUrl = parseRedisUrl(readValue(env, 'REDIS_URL'), problems);
+
+  // Optional PostgreSQL connection (matches `docker compose up -d postgres`).
+  // Absent means "persistence disabled", so the server still boots without a
+  // database; the API then answers 503 and runs are not recorded.
+  const databaseUrl = parseDatabaseUrl(readValue(env, 'DATABASE_URL'), problems);
+
   const githubAppId = parseGitHubAppId(readValue(env, 'GITHUB_APP_ID'), problems);
   const githubPrivateKey = parsePrivateKey(
     readValue(env, 'GITHUB_PRIVATE_KEY'),
@@ -308,6 +344,7 @@ export function loadConfig(
   return {
     port,
     redisUrl,
+    databaseUrl,
     githubAppId,
     githubPrivateKey,
     webhookSecret,
