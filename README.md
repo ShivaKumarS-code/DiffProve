@@ -15,7 +15,7 @@ See [docs/architecture.md](docs/architecture.md) for the full system design and
 | 1 | GitHub App & webhook ingestion (HMAC verification, `queued` check runs, BullMQ queue) | complete |
 | 2 | Diff splitter (test-only vs full patches, no-test-changes short-circuit) | complete |
 | 3 | E2B differential sandbox runner (Run A / Run B, egress lockdown, snapshot cache, verdict check runs) | complete |
-| 4 | Verdict reporting & dashboard | pending |
+| 4 | Verdict reporting & dashboard (rich check-run Markdown, PostgreSQL history, Next.js UI) | complete |
 
 ## Development
 

@@ -1,6 +1,7 @@
 # Local development dependencies.
-# The test suite does NOT require these services: Redis integration tests are
-# gated behind process.env.REDIS_URL and skip when it is unset.
+# The test suite does NOT require these services: Redis and PostgreSQL
+# integration tests are gated behind process.env.REDIS_URL / DATABASE_URL and
+# skip when unset.
 services:
   redis:
     image: redis:7-alpine
@@ -10,5 +11,22 @@ services:
       - redis-data:/data
     command: ['redis-server', '--appendonly', 'yes']
 
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: diffprove
+      POSTGRES_PASSWORD: diffprove
+      POSTGRES_DB: diffprove
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U diffprove -d diffprove']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   redis-data:
+  pg-data:
