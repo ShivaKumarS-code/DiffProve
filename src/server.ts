@@ -6,10 +6,12 @@
  * clients, the Octokit transport, Fastify). `src/app.ts` stays injected so it
  * can be tested without any of it.
  *
- * Phase 1 + 2 scope (architecture, "End-to-End Verification Pipeline" steps
- * 1-2): accept verified webhooks, post a `queued` check run, and consume each
- * job through the diff splitter — reporting the no-test-changes short-circuit
- * as `neutral`, and deferring real differential runs to the Phase 3 sandbox.
+ * Phase 1 + 2 + 3 scope (architecture, "End-to-End Verification Pipeline"
+ * steps 1-6): accept verified webhooks, post a `queued` check run, split each
+ * PR's diff, and — for PRs with test changes — run the differential (Run A
+ * base + Test-Only Patch, Run B head + Full PR Patch) in an E2B sandbox with
+ * egress locked down, then complete the check run with the mapped verdict.
+ * PRs without test changes short-circuit to `neutral` as before.
  */
 
 import 'dotenv/config';
@@ -20,9 +22,15 @@ import { createCheckRunPoster } from './github/checks.js';
 import { createCheckRunReporter } from './github/check-runs.js';
 import { createAppAuthenticator, createOctokit } from './github/octokit.js';
 import { createPrDiffClient } from './github/pulls.js';
+import { createRepoContentClient } from './github/repo-content.js';
+import { createRepoTarballClient } from './github/repo-tarball.js';
+import { createVerdictReporter } from './github/verdict-report.js';
+import { createDifferentialHandler } from './queue/differential-handler.js';
 import { createEnqueuer } from './queue/enqueuer.js';
-import { createDiffSplittingHandler } from './queue/diff-handler.js';
 import { startWorker } from './queue/worker.js';
+import { createE2bDifferentialRunner } from './runner/e2b-runner.js';
+import { createE2bSandboxFactory } from './runner/e2b-sandbox.js';
+import { createRedisKeyValueStore, createSnapshotCache } from './runner/snapshot-cache.js';
 
 /** Signals that start the graceful shutdown sequence. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -54,7 +62,8 @@ async function main(): Promise<void> {
   const enqueuer = createEnqueuer(config.redisUrl);
 
   // One shared auth-less transport + authenticator backs every GitHub call:
-  // the Phase 1 queued-check-run poster and the Phase 2 diff/report clients.
+  // the queued-check-run poster, the diff/report clients, and the Phase 3
+  // repo-content, tarball, and verdict reporters.
   const octokit = createOctokit();
   const authenticator = createAppAuthenticator(config.githubAppId, config.githubPrivateKey);
   const checkPoster = createCheckRunPoster(octokit, authenticator);
@@ -66,14 +75,35 @@ async function main(): Promise<void> {
     logLevel: config.logLevel,
   });
 
-  // Phase 2 handler: fetch the PR diff, split it, and either report the
-  // no-test-changes short-circuit (neutral check run) or defer to the Phase 3
-  // sandbox runner while the check run stays queued from Phase 1.
+  // Phase 3 differential runner. Without an E2B_API_KEY there is no sandbox, so
+  // the runner port is null: the handler logs a warning per job and leaves the
+  // check run queued instead of pretending a verification happened.
+  const e2bApiKey = config.e2bApiKey;
+  const snapshotKv = e2bApiKey === null ? null : createRedisKeyValueStore(config.redisUrl);
+  const runner =
+    e2bApiKey === null || snapshotKv === null
+      ? null
+      : createE2bDifferentialRunner({
+          sandboxFactory: createE2bSandboxFactory(),
+          apiKey: e2bApiKey,
+          defaultTemplateId: config.e2bTemplateId ?? undefined,
+          snapshotCache: createSnapshotCache(snapshotKv),
+          logger: app.log,
+          installTimeoutMs: config.e2bInstallTimeoutMs,
+          testTimeoutMs: config.e2bTestTimeoutMs,
+        });
+
+  // Phase 3 handler: split the diff, short-circuit PRs without test changes,
+  // and otherwise provision + execute the differential and report the verdict.
   const worker = startWorker(
     config.redisUrl,
-    createDiffSplittingHandler({
+    createDifferentialHandler({
       prDiff: createPrDiffClient(octokit, authenticator),
       checkRuns: createCheckRunReporter(octokit, authenticator),
+      repoContent: createRepoContentClient(octokit, authenticator),
+      repoTarball: createRepoTarballClient(octokit, authenticator),
+      runner,
+      verdicts: createVerdictReporter(octokit, authenticator),
       logger: app.log,
     }),
     { logger: app.log },
@@ -94,8 +124,12 @@ async function main(): Promise<void> {
     app.log.info(`received ${signal}, shutting down`);
 
     // Order matters: stop consuming jobs first so no handler starts mid-teardown,
-    // then release the enqueuer's Redis client, then close the HTTP server.
+    // then release the snapshot-cache Redis client (worker side only), then the
+    // enqueuer's, then close the HTTP server.
     await worker.close();
+    if (snapshotKv !== null) {
+      await snapshotKv.close();
+    }
     await enqueuer.close();
     await app.close();
 

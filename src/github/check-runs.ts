@@ -33,6 +33,36 @@ function httpStatusOf(error: unknown): number | undefined {
 }
 
 /**
+ * Finds the DiffProve check run posted for a commit, by name.
+ *
+ * Shared by both completion paths — `reportNoTestChanges` below and the
+ * differential `reportVerdict` in `src/github/verdict-report.ts` — so they
+ * locate the queued Phase 1 run identically. Resolves null when no run on the
+ * commit carries `CHECK_RUN_NAME`.
+ *
+ * Request failures are deliberately not wrapped here: each caller owns the
+ * token-free error message for its own operation, and letting the error escape
+ * keeps a single wrapping layer (no duplicated HTTP-status suffixes).
+ */
+export async function findDiffProveCheckRun(
+  octokit: Octokit,
+  input: { owner: string; repo: string; ref: string; headers: Record<string, string> },
+): Promise<{ id: number } | null> {
+  const listed = await octokit.request(LIST_CHECK_RUNS_ROUTE, {
+    owner: input.owner,
+    repo: input.repo,
+    ref: input.ref,
+    headers: input.headers,
+  });
+
+  // First match wins: Phase 1 posts at most one run under this name per head
+  // commit, so duplicates would only come from outside the App.
+  const queued = listed.data.check_runs.find((checkRun) => checkRun.name === CHECK_RUN_NAME);
+
+  return queued ? { id: Number(queued.id) } : null;
+}
+
+/**
  * Builds the `CheckRunReporter`.
  *
  * The transport is auth-less (see `src/github/octokit.ts`), so the installation
@@ -55,24 +85,18 @@ export function createCheckRunReporter(
       const output = { title: report.title, summary: report.summary };
 
       try {
-        const listed = await octokit.request(LIST_CHECK_RUNS_ROUTE, {
+        const queued = await findDiffProveCheckRun(octokit, {
           owner,
           repo,
           ref: report.headSha,
           headers,
         });
 
-        // First match wins: Phase 1 posts at most one run under this name per
-        // head commit, so duplicates would only come from outside the App.
-        const queued = listed.data.check_runs.find(
-          (checkRun) => checkRun.name === CHECK_RUN_NAME,
-        );
-
         if (queued) {
           await octokit.request(PATCH_CHECK_RUN_ROUTE, {
             owner,
             repo,
-            check_run_id: Number(queued.id),
+            check_run_id: queued.id,
             status: 'completed',
             conclusion: 'neutral',
             output,

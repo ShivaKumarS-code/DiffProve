@@ -10,8 +10,9 @@
  * Security (architecture guardrail #2): secrets must never be logged or
  * leaked. Consequently the error messages below name the offending variable
  * but never echo its value for `GITHUB_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`,
- * or `REDIS_URL` (the latter may embed credentials). Only non-secret,
- * enumerated values such as `PORT` and `LOG_LEVEL` are quoted back.
+ * `E2B_API_KEY`, or `REDIS_URL` (the latter may embed credentials). Only
+ * non-secret, enumerated values such as `PORT`, `LOG_LEVEL`, and the E2B
+ * timeouts are quoted back.
  */
 
 /** Validated runtime configuration for the GitHub App server. */
@@ -24,6 +25,21 @@ export interface AppConfig {
   githubPrivateKey: string;
   webhookSecret: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  /**
+   * E2B API key for the differential sandbox runner. Null when sandbox
+   * execution is not configured: jobs with test changes then stay `queued`
+   * instead of producing a verdict. Secret — never echoed in errors or logs.
+   */
+  e2bApiKey: string | null;
+  /**
+   * Optional custom E2B sandbox template id. Null means "use the SDK default
+   * template", which is enough for most Python/Node repositories.
+   */
+  e2bTemplateId: string | null;
+  /** Timeout for each targeted test command (Run A / Run B) inside the sandbox. */
+  e2bTestTimeoutMs: number;
+  /** Timeout for dependency installation before a snapshot is taken. */
+  e2bInstallTimeoutMs: number;
 }
 
 /** Thrown by {@link loadConfig} when the environment is missing or invalid. */
@@ -37,6 +53,14 @@ export class ConfigError extends Error {
 const DEFAULT_PORT = 3000;
 const DEFAULT_REDIS_URL = 'redis://127.0.0.1:6379';
 const DEFAULT_LOG_LEVEL: AppConfig['logLevel'] = 'info';
+
+/**
+ * Sandbox timeouts (docs/architecture.md, "End-to-End Verification Pipeline"
+ * step 3): installing dependencies is allowed to take longer than a single
+ * targeted test command, and both stay within E2B's sandbox lifetime limits.
+ */
+const DEFAULT_E2B_TEST_TIMEOUT_MS = 120_000;
+const DEFAULT_E2B_INSTALL_TIMEOUT_MS = 240_000;
 
 const MIN_PORT = 1;
 const MAX_PORT = 65535;
@@ -190,10 +214,51 @@ function parseLogLevel(
 }
 
 /**
+ * Optional opaque text value (`E2B_API_KEY`, `E2B_TEMPLATE_ID`).
+ *
+ * Unset and blank both map to null. No format is imposed: the API key is a
+ * token passed straight to the E2B SDK and the template id is provider-defined.
+ * The value is never echoed in errors — for `E2B_API_KEY` that is a security
+ * requirement, not a style choice.
+ */
+function parseOptionalText(value: string | undefined): string | null {
+  return value ?? null;
+}
+
+/**
+ * Parse a positive timeout in milliseconds, falling back to `defaultValue`
+ * when unset.
+ *
+ * The digits-only gate matches `PORT`: it rejects "0", "-5", "1.5", "1e3", and
+ * trailing garbage before `Number` can coerce a surprising value. Echoing the
+ * value is safe — unlike an API key, a timeout is not a secret.
+ */
+function parseTimeoutMs(
+  name: string,
+  value: string | undefined,
+  defaultValue: number,
+  problems: string[],
+): number {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  const parsed = DIGITS_ONLY.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    problems.push(
+      `${name}: must be a positive integer number of milliseconds (got ${JSON.stringify(value)})`,
+    );
+    return defaultValue;
+  }
+  return parsed;
+}
+
+/**
  * Validate an environment bag and return a frozen-by-convention `AppConfig`.
  *
  * Defaults: `PORT=3000`, `REDIS_URL=redis://127.0.0.1:6379` (matches
- * `docker compose up -d redis`), `LOG_LEVEL=info`.
+ * `docker compose up -d redis`), `LOG_LEVEL=info`, no E2B API key or template
+ * (sandbox execution disabled), `E2B_TEST_TIMEOUT_MS=120000`,
+ * `E2B_INSTALL_TIMEOUT_MS=240000`.
  *
  * @throws {ConfigError} listing every missing or invalid variable at once.
  */
@@ -215,6 +280,23 @@ export function loadConfig(
   );
   const logLevel = parseLogLevel(readValue(env, 'LOG_LEVEL'), problems);
 
+  // Optional E2B sandbox settings: absent means "sandbox disabled", so the
+  // server still boots (and PRs with test changes stay queued) without a key.
+  const e2bApiKey = parseOptionalText(readValue(env, 'E2B_API_KEY'));
+  const e2bTemplateId = parseOptionalText(readValue(env, 'E2B_TEMPLATE_ID'));
+  const e2bTestTimeoutMs = parseTimeoutMs(
+    'E2B_TEST_TIMEOUT_MS',
+    readValue(env, 'E2B_TEST_TIMEOUT_MS'),
+    DEFAULT_E2B_TEST_TIMEOUT_MS,
+    problems,
+  );
+  const e2bInstallTimeoutMs = parseTimeoutMs(
+    'E2B_INSTALL_TIMEOUT_MS',
+    readValue(env, 'E2B_INSTALL_TIMEOUT_MS'),
+    DEFAULT_E2B_INSTALL_TIMEOUT_MS,
+    problems,
+  );
+
   if (problems.length > 0) {
     throw new ConfigError(
       ['Invalid environment configuration:', ...problems.map((p) => `  - ${p}`)].join(
@@ -230,5 +312,9 @@ export function loadConfig(
     githubPrivateKey,
     webhookSecret,
     logLevel,
+    e2bApiKey,
+    e2bTemplateId,
+    e2bTestTimeoutMs,
+    e2bInstallTimeoutMs,
   };
 }

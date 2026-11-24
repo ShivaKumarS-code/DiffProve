@@ -3,9 +3,10 @@
  *
  * The worker is deliberately thin: it owns the BullMQ lifecycle and hands each
  * dequeued `VerificationJob` to a pluggable `VerificationJobHandler`. The
- * handler is injected by the composition root: Phase 2 passes the
- * diff-splitting handler (src/queue/diff-handler.ts), and Phase 3 will swap in
- * the Run A / Run B sandbox pipeline without touching the queuing code.
+ * handler is injected by the composition root: Phase 3 passes the
+ * differential pipeline handler (src/queue/differential-handler.ts), and a
+ * future phase can swap in an upgraded pipeline without touching the queuing
+ * code.
  *
  * As with the enqueuer, importing this module opens no Redis connection —
  * `startWorker` is what constructs the client.

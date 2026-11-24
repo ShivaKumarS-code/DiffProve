@@ -32,6 +32,10 @@ function fullEnv(): Record<string, string | undefined> {
     GITHUB_PRIVATE_KEY: FAKE_PEM,
     GITHUB_WEBHOOK_SECRET: 'placeholder-webhook-secret',
     LOG_LEVEL: 'debug',
+    E2B_API_KEY: 'e2b_placeholder_api_key',
+    E2B_TEMPLATE_ID: 'diffprove-placeholder-template',
+    E2B_TEST_TIMEOUT_MS: '90000',
+    E2B_INSTALL_TIMEOUT_MS: '180000',
   };
 }
 
@@ -59,6 +63,10 @@ describe('loadConfig with valid input', () => {
       githubPrivateKey: FAKE_PEM,
       webhookSecret: 'placeholder-webhook-secret',
       logLevel: 'debug',
+      e2bApiKey: 'e2b_placeholder_api_key',
+      e2bTemplateId: 'diffprove-placeholder-template',
+      e2bTestTimeoutMs: 90000,
+      e2bInstallTimeoutMs: 180000,
     });
   });
 
@@ -248,5 +256,124 @@ describe('loadConfig with missing or invalid input', () => {
     expect(error.message).toContain('GITHUB_WEBHOOK_SECRET');
     expect(error.message).not.toContain('hunter2');
     expect(error.message).not.toContain('SUPER_SECRET_GARBAGE_VALUE');
+  });
+});
+
+describe('loadConfig — E2B sandbox settings', () => {
+  it('defaults to sandbox execution disabled with the documented timeouts', () => {
+    const config = loadConfig(requiredEnv());
+
+    expect(config.e2bApiKey).toBeNull();
+    expect(config.e2bTemplateId).toBeNull();
+    expect(config.e2bTestTimeoutMs).toBe(120000);
+    expect(config.e2bInstallTimeoutMs).toBe(240000);
+  });
+
+  it('parses explicitly configured E2B values', () => {
+    const config = loadConfig({
+      ...requiredEnv(),
+      E2B_API_KEY: 'e2b_placeholder_api_key',
+      E2B_TEMPLATE_ID: 'diffprove-placeholder-template',
+      E2B_TEST_TIMEOUT_MS: '45000',
+      E2B_INSTALL_TIMEOUT_MS: '300000',
+    });
+
+    expect(config.e2bApiKey).toBe('e2b_placeholder_api_key');
+    expect(config.e2bTemplateId).toBe('diffprove-placeholder-template');
+    expect(config.e2bTestTimeoutMs).toBe(45000);
+    expect(config.e2bInstallTimeoutMs).toBe(300000);
+  });
+
+  it('accepts any non-blank E2B_API_KEY: the value is opaque to the server', () => {
+    const config = loadConfig({
+      ...requiredEnv(),
+      E2B_API_KEY: 'not-a-real-key-format',
+    });
+
+    expect(config.e2bApiKey).toBe('not-a-real-key-format');
+  });
+
+  it('trims surrounding whitespace on E2B values', () => {
+    const config = loadConfig({
+      ...requiredEnv(),
+      E2B_API_KEY: '  e2b_placeholder_api_key  ',
+      E2B_TEMPLATE_ID: '  diffprove-placeholder-template  ',
+      E2B_TEST_TIMEOUT_MS: '  45000  ',
+      E2B_INSTALL_TIMEOUT_MS: ' 300000 ',
+    });
+
+    expect(config.e2bApiKey).toBe('e2b_placeholder_api_key');
+    expect(config.e2bTemplateId).toBe('diffprove-placeholder-template');
+    expect(config.e2bTestTimeoutMs).toBe(45000);
+    expect(config.e2bInstallTimeoutMs).toBe(300000);
+  });
+
+  it('treats blank E2B values as unset', () => {
+    const config = loadConfig({
+      ...requiredEnv(),
+      E2B_API_KEY: '   ',
+      E2B_TEMPLATE_ID: '',
+      E2B_TEST_TIMEOUT_MS: '\t',
+      E2B_INSTALL_TIMEOUT_MS: ' ',
+    });
+
+    expect(config.e2bApiKey).toBeNull();
+    expect(config.e2bTemplateId).toBeNull();
+    expect(config.e2bTestTimeoutMs).toBe(120000);
+    expect(config.e2bInstallTimeoutMs).toBe(240000);
+  });
+});
+
+describe('loadConfig — invalid E2B settings', () => {
+  it.each(['0', '-5', 'abc', '1.5', '1e3'])(
+    'rejects invalid E2B_TEST_TIMEOUT_MS value %j',
+    (timeout) => {
+      const error = captureConfigError({
+        ...requiredEnv(),
+        E2B_TEST_TIMEOUT_MS: timeout,
+      });
+
+      expect(error.message).toContain('E2B_TEST_TIMEOUT_MS');
+      expect(error.message).not.toContain('GITHUB_PRIVATE_KEY');
+    },
+  );
+
+  it.each(['0', '-5', 'abc'])(
+    'rejects invalid E2B_INSTALL_TIMEOUT_MS value %j',
+    (timeout) => {
+      const error = captureConfigError({
+        ...requiredEnv(),
+        E2B_INSTALL_TIMEOUT_MS: timeout,
+      });
+
+      expect(error.message).toContain('E2B_INSTALL_TIMEOUT_MS');
+      expect(error.message).not.toContain('GITHUB_PRIVATE_KEY');
+    },
+  );
+
+  it('aggregates both invalid timeouts into a single ConfigError', () => {
+    const error = captureConfigError({
+      ...requiredEnv(),
+      E2B_TEST_TIMEOUT_MS: '0',
+      E2B_INSTALL_TIMEOUT_MS: '-5',
+    });
+
+    expect(error.name).toBe('ConfigError');
+    expect(error.message).toContain('Invalid environment configuration');
+    expect(error.message).toContain('E2B_TEST_TIMEOUT_MS');
+    expect(error.message).toContain('E2B_INSTALL_TIMEOUT_MS');
+  });
+
+  it('never leaks the E2B_API_KEY value in the error message', () => {
+    const bogusApiKey = 'SUPER_SECRET_E2B_API_KEY_VALUE';
+    const error = captureConfigError({
+      ...requiredEnv(),
+      E2B_API_KEY: bogusApiKey,
+      E2B_TEST_TIMEOUT_MS: 'abc',
+    });
+
+    expect(error.message).toContain('E2B_TEST_TIMEOUT_MS');
+    expect(error.message).not.toContain(bogusApiKey);
+    expect(error.message).not.toContain('E2B_API_KEY');
   });
 });
