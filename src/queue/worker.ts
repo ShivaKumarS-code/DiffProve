@@ -1,10 +1,11 @@
 /**
- * Verification worker bootstrap (Phase 1).
+ * Verification worker bootstrap.
  *
  * The worker is deliberately thin: it owns the BullMQ lifecycle and hands each
- * dequeued `VerificationJob` to a pluggable `VerificationJobHandler`. Phase 1
- * ships only `createLogOnlyHandler`; Phases 2-3 plug in the Run A / Run B
- * differential pipeline without touching the queuing code.
+ * dequeued `VerificationJob` to a pluggable `VerificationJobHandler`. The
+ * handler is injected by the composition root: Phase 2 passes the
+ * diff-splitting handler (src/queue/diff-handler.ts), and Phase 3 will swap in
+ * the Run A / Run B sandbox pipeline without touching the queuing code.
  *
  * As with the enqueuer, importing this module opens no Redis connection —
  * `startWorker` is what constructs the client.
@@ -16,17 +17,8 @@ import { Redis } from 'ioredis';
 import type { Logger, VerificationJob, VerificationJobHandler } from '../domain.js';
 import { VERIFICATION_QUEUE_NAME } from './enqueuer.js';
 
-/** Phase-1 placeholder handler: logs the job and resolves. The real differential pipeline lands in Phases 2-3. */
-export function createLogOnlyHandler(logger: Logger): VerificationJobHandler {
-  return async (job: VerificationJob): Promise<void> => {
-    logger.info(
-      `verification job received: repo=${job.repoFullName} pr=${job.prNumber} head=${job.headSha} (Phase 1 log-only handler)`,
-    );
-  };
-}
-
 /**
- * Starts consuming `diffprove:verification` and invokes `handler` per job.
+ * Starts consuming `diffprove-verification` and invokes `handler` per job.
  *
  * The returned `close()` drains and closes the worker (and the Redis
  * connections BullMQ derives from the supplied client), then quits the base
