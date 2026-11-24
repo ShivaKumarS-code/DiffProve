@@ -6,9 +6,10 @@
  * clients, the Octokit transport, Fastify). `src/app.ts` stays injected so it
  * can be tested without any of it.
  *
- * Phase 1 scope (architecture, "End-to-End Verification Pipeline" step 1): accept
- * verified webhooks, post a `queued` check run, and enqueue a job that the
- * log-only worker consumes. Phases 2-3 replace the handler, not this wiring.
+ * Phase 1 + 2 scope (architecture, "End-to-End Verification Pipeline" steps
+ * 1-2): accept verified webhooks, post a `queued` check run, and consume each
+ * job through the diff splitter — reporting the no-test-changes short-circuit
+ * as `neutral`, and deferring real differential runs to the Phase 3 sandbox.
  */
 
 import 'dotenv/config';
@@ -16,9 +17,12 @@ import 'dotenv/config';
 import { buildApp } from './app.js';
 import { ConfigError, loadConfig, type AppConfig } from './config.js';
 import { createCheckRunPoster } from './github/checks.js';
+import { createCheckRunReporter } from './github/check-runs.js';
 import { createAppAuthenticator, createOctokit } from './github/octokit.js';
+import { createPrDiffClient } from './github/pulls.js';
 import { createEnqueuer } from './queue/enqueuer.js';
-import { createLogOnlyHandler, startWorker } from './queue/worker.js';
+import { createDiffSplittingHandler } from './queue/diff-handler.js';
+import { startWorker } from './queue/worker.js';
 
 /** Signals that start the graceful shutdown sequence. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -48,10 +52,12 @@ async function main(): Promise<void> {
 
   // Real ports. Nothing below logs a config value.
   const enqueuer = createEnqueuer(config.redisUrl);
-  const checkPoster = createCheckRunPoster(
-    createOctokit(),
-    createAppAuthenticator(config.githubAppId, config.githubPrivateKey),
-  );
+
+  // One shared auth-less transport + authenticator backs every GitHub call:
+  // the Phase 1 queued-check-run poster and the Phase 2 diff/report clients.
+  const octokit = createOctokit();
+  const authenticator = createAppAuthenticator(config.githubAppId, config.githubPrivateKey);
+  const checkPoster = createCheckRunPoster(octokit, authenticator);
 
   const app = buildApp({
     webhookSecret: config.webhookSecret,
@@ -60,11 +66,18 @@ async function main(): Promise<void> {
     logLevel: config.logLevel,
   });
 
-  // Phase 1 handler only logs the job; Phases 2-3 swap in the differential
-  // pipeline (Run A / Run B) without changing the queue wiring.
-  const worker = startWorker(config.redisUrl, createLogOnlyHandler(app.log), {
-    logger: app.log,
-  });
+  // Phase 2 handler: fetch the PR diff, split it, and either report the
+  // no-test-changes short-circuit (neutral check run) or defer to the Phase 3
+  // sandbox runner while the check run stays queued from Phase 1.
+  const worker = startWorker(
+    config.redisUrl,
+    createDiffSplittingHandler({
+      prDiff: createPrDiffClient(octokit, authenticator),
+      checkRuns: createCheckRunReporter(octokit, authenticator),
+      logger: app.log,
+    }),
+    { logger: app.log },
+  );
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
   // The single startup line. Host and port are not secrets; everything else is.
