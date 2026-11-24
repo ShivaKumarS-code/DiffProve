@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import type { RepoConfig, RepoConfigStore, VerificationRunStore } from '../db/types.js';
 import type { Logger, VerificationJob } from '../domain.js';
 import { DEFAULT_TEST_GLOBS } from '../diff/types.js';
 import type { CheckRunReporter, PrDiffClient } from '../diff/types.js';
@@ -52,6 +53,30 @@ const TEST_ONLY_SECTION = [
 ].join('\n');
 
 const MIXED_DIFF = IMPL_ONLY_DIFF + TEST_ONLY_SECTION;
+
+/**
+ * A Python test file that ONLY the repo-configured `*_snap.py` glob matches:
+ * none of the default globs (`test_*.py`, `*_test.py`, `*.test.ts`, `*.spec.ts`)
+ * classify it as a test.
+ */
+const SNAPSHOT_TEST_DIFF = [
+  'diff --git a/tests/checkout_snap.py b/tests/checkout_snap.py',
+  'new file mode 100644',
+  'index 0000000..5555555',
+  '--- /dev/null',
+  '+++ b/tests/checkout_snap.py',
+  '@@ -0,0 +1,3 @@',
+  '+def test_checkout():',
+  '+    assert checkout() == 3',
+  '+',
+].join('\n');
+
+/** A `repositories` row with no overrides (the defaults apply). */
+const DEFAULT_REPO_CONFIG: RepoConfig = {
+  testFileGlobs: null,
+  testCommand: null,
+  enabled: true,
+};
 
 const JOB: VerificationJob = {
   repoFullName: 'octocat/hello-world',
@@ -137,6 +162,12 @@ const RUN_A_TIMEOUT: SandboxRawResult = {
 interface HarnessOptions {
   /** Pass `null` to simulate an environment without E2B configured. */
   runner?: DifferentialRunner | null;
+  /** Config the fake store resolves; null (the default) = no `repositories` row. */
+  repoConfig?: RepoConfig | null;
+  /** Pass `null` to simulate an environment without PostgreSQL (no config store). */
+  repoConfigStore?: RepoConfigStore | null;
+  /** Pass `null` to simulate an environment without PostgreSQL (no run persistence). */
+  runs?: VerificationRunStore | null;
 }
 
 /** Builds the handler wired to fakes for every injected port. */
@@ -148,9 +179,18 @@ function buildHarness(options: HarnessOptions = {}) {
   const repoTarball = vi.fn<RepoTarballClient>();
   const runnerMock = vi.fn<DifferentialRunner>();
   const reportVerdict = vi.fn<VerdictReporter['reportVerdict']>();
+  const lookupConfig = vi.fn<RepoConfigStore['lookupConfig']>();
+  const insertRun = vi.fn<VerificationRunStore['insertRun']>();
   const info = vi.fn<Logger['info']>();
   const warn = vi.fn<Logger['warn']>();
   const error = vi.fn<Logger['error']>();
+
+  lookupConfig.mockResolvedValue(options.repoConfig ?? null);
+
+  const runsStore: VerificationRunStore = {
+    insertRun,
+    listRuns: vi.fn<VerificationRunStore['listRuns']>(),
+  };
 
   const handler = createDifferentialHandler({
     prDiff,
@@ -159,6 +199,9 @@ function buildHarness(options: HarnessOptions = {}) {
     repoTarball,
     runner: options.runner === undefined ? runnerMock : options.runner,
     verdicts: { reportVerdict },
+    repoConfig:
+      options.repoConfigStore === undefined ? { lookupConfig } : options.repoConfigStore,
+    runs: options.runs === undefined ? runsStore : options.runs,
     logger: { info, warn, error },
   });
 
@@ -171,6 +214,8 @@ function buildHarness(options: HarnessOptions = {}) {
     repoTarball,
     runner: runnerMock,
     reportVerdict,
+    lookupConfig,
+    insertRun,
     info,
     warn,
     error,
@@ -232,6 +277,10 @@ describe('createDifferentialHandler — no test changes', () => {
       installationId: 42,
     });
 
+    // Phase 4: the repo config is consulted (no row → defaults apply).
+    expect(harness.lookupConfig).toHaveBeenCalledTimes(1);
+    expect(harness.lookupConfig).toHaveBeenCalledWith('octocat/hello-world');
+
     expect(harness.reportNoTestChanges).toHaveBeenCalledTimes(1);
     expect(harness.reportNoTestChanges).toHaveBeenCalledWith({
       repoFullName: 'octocat/hello-world',
@@ -252,6 +301,7 @@ describe('createDifferentialHandler — no test changes', () => {
     expect(harness.listPaths).not.toHaveBeenCalled();
     expect(harness.repoTarball).not.toHaveBeenCalled();
     expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
     expect(harness.warn).not.toHaveBeenCalled();
     expect(harness.error).not.toHaveBeenCalled();
   });
@@ -270,6 +320,74 @@ describe('createDifferentialHandler — no test changes', () => {
     expect(messagesOf(harness.info)).toContain(
       'split: 1 file(s) changed, 0 test file(s), 0 runnable: (none)',
     );
+  });
+});
+
+describe('createDifferentialHandler — repository disabled', () => {
+  it('leaves the job queued without fetching the diff or calling any other port', async () => {
+    const harness = buildHarness({ repoConfig: { ...DEFAULT_REPO_CONFIG, enabled: false } });
+
+    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+
+    // The lookup happens first and the `enabled: false` short-circuit returns
+    // before the diff, so nothing downstream — GitHub, sandbox, or database —
+    // is touched.
+    expect(harness.lookupConfig).toHaveBeenCalledTimes(1);
+    expect(harness.lookupConfig).toHaveBeenCalledWith('octocat/hello-world');
+    expect(harness.prDiff).not.toHaveBeenCalled();
+    expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
+    expect(harness.fetchTextFile).not.toHaveBeenCalled();
+    expect(harness.listPaths).not.toHaveBeenCalled();
+    expect(harness.repoTarball).not.toHaveBeenCalled();
+    expect(harness.runner).not.toHaveBeenCalled();
+    expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
+
+    expect(harness.warn).toHaveBeenCalledTimes(1);
+    const warning = firstMessage(harness.warn);
+    expect(warning).toContain('octocat/hello-world');
+    expect(warning).toContain('disabled');
+    expect(warning).toContain('queued');
+    expect(harness.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('createDifferentialHandler — repo-configured test globs', () => {
+  it('splits with the configured globs instead of the defaults', async () => {
+    // E2B is off so the handler stops right after splitting: reaching the E2B
+    // warning (instead of the neutral report) proves the diff had test changes.
+    const harness = buildHarness({
+      runner: null,
+      repoConfig: { ...DEFAULT_REPO_CONFIG, testFileGlobs: ['*_snap.py'] },
+    });
+    harness.prDiff.mockResolvedValue(SNAPSHOT_TEST_DIFF);
+
+    await harness.handler(JOB);
+
+    expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
+    expect(harness.warn).toHaveBeenCalledTimes(1);
+    const warning = firstMessage(harness.warn);
+    expect(warning).toContain('E2B_API_KEY');
+    expect(warning).toContain('tests/checkout_snap.py');
+    expect(harness.insertRun).not.toHaveBeenCalled();
+  });
+
+  it('lists the configured globs in the no-test-changes summary', async () => {
+    const harness = buildHarness({
+      repoConfig: { ...DEFAULT_REPO_CONFIG, testFileGlobs: ['*_snap.py'] },
+    });
+    harness.prDiff.mockResolvedValue(IMPL_ONLY_DIFF);
+
+    await harness.handler(JOB);
+
+    expect(harness.reportNoTestChanges).toHaveBeenCalledTimes(1);
+    const summary = harness.reportNoTestChanges.mock.calls[0]?.[0]?.summary ?? '';
+    expect(summary).toContain('(*_snap.py)');
+
+    // The override replaces the defaults; it does not extend them.
+    for (const glob of ['test_*.py', '*_test.py', '*.test.ts', '*.spec.ts']) {
+      expect(summary).not.toContain(glob);
+    }
   });
 });
 
@@ -294,6 +412,26 @@ describe('createDifferentialHandler — E2B not configured', () => {
     expect(harness.runner).not.toHaveBeenCalled();
     expect(harness.reportVerdict).not.toHaveBeenCalled();
     expect(harness.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('createDifferentialHandler — repo-configured test command', () => {
+  it('runs exactly the configured command instead of the built one', async () => {
+    const harness = buildHarness({
+      repoConfig: { ...DEFAULT_REPO_CONFIG, testCommand: 'npm test -- --runInBand' },
+    });
+    givenVitestRepo(harness);
+    harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
+    harness.reportVerdict.mockResolvedValue(undefined);
+
+    await harness.handler(JOB);
+
+    const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
+    // The auto-detected command would be `npx vitest run "tests/app.test.ts"`.
+    expect(request?.testCommand).toBe('npm test -- --runInBand');
+    // Everything else about the run request is unchanged.
+    expect(request?.installCommand).toBe('npm ci');
+    expect(request?.runnerKind).toBe('vitest');
   });
 });
 
@@ -369,6 +507,31 @@ describe('createDifferentialHandler — verified fix', () => {
     });
     expect(report?.summary).toContain('0.8s');
     expect(report?.summary).toContain('2.0s');
+
+    // Phase 4, pipeline step 6: the run is persisted once, with the exact row.
+    // Each fixture populates exactly one output stream, so the classified
+    // excerpts are the fixtures' text (stdout first, then stderr).
+    expect(harness.insertRun).toHaveBeenCalledTimes(1);
+    expect(harness.insertRun).toHaveBeenCalledWith({
+      repoFullName: 'octocat/hello-world',
+      installationId: 42,
+      language: 'node',
+      prNumber: 7,
+      baseSha: 'base123',
+      headSha: 'head456',
+      changedTestFiles: ['tests/app.test.ts'],
+      runAStatus: 'fail',
+      runBStatus: 'pass',
+      verdict: 'verified-fix',
+      durationMs: RUN_A_FAIL.durationMs + RUN_B_PASS.durationMs,
+      runALog: RUN_A_FAIL.stderr,
+      runBLog: RUN_B_PASS.stdout,
+    });
+
+    // Persistence happens only after GitHub accepted the verdict.
+    expect(harness.reportVerdict.mock.invocationCallOrder[0]).toBeLessThan(
+      harness.insertRun.mock.invocationCallOrder[0] ?? 0,
+    );
 
     const logged = messagesOf(harness.info);
     expect(logged.some((message) => message.includes('(differential pipeline)'))).toBe(true);
@@ -505,6 +668,66 @@ describe('createDifferentialHandler — verdict report failure', () => {
     const logged = firstMessage(harness.error);
     expect(logged).toContain('failed to report verdict verified-fix');
     expect(logged).toContain('HTTP 500');
+    // An unreported verdict must never be persisted either.
+    expect(harness.insertRun).not.toHaveBeenCalled();
+    expect(
+      messagesOf(harness.info).some((message) =>
+        message.includes('reported verdict verified-fix'),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('createDifferentialHandler — no database configured', () => {
+  it('splits with the default globs when no config store is configured', async () => {
+    const harness = buildHarness({ repoConfigStore: null });
+    harness.prDiff.mockResolvedValue(IMPL_ONLY_DIFF);
+
+    await harness.handler(JOB);
+
+    expect(harness.lookupConfig).not.toHaveBeenCalled();
+    const summary = harness.reportNoTestChanges.mock.calls[0]?.[0]?.summary ?? '';
+    expect(summary).toContain(`(${DEFAULT_TEST_GLOBS.join(', ')})`);
+  });
+
+  it('reports the verdict without persisting a run when runs is null', async () => {
+    const harness = buildHarness({ runs: null });
+    givenVitestRepo(harness);
+    harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
+    harness.reportVerdict.mockResolvedValue(undefined);
+
+    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+
+    expect(harness.reportVerdict).toHaveBeenCalledTimes(1);
+    expect(harness.insertRun).not.toHaveBeenCalled();
+    expect(harness.error).not.toHaveBeenCalled();
+    expect(messagesOf(harness.info)).toContain(
+      'reported verdict verified-fix for octocat/hello-world#7',
+    );
+  });
+});
+
+describe('createDifferentialHandler — run persistence failure', () => {
+  it('logs and rethrows after the verdict was reported so BullMQ retries', async () => {
+    const harness = buildHarness();
+    givenVitestRepo(harness);
+    harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
+    harness.reportVerdict.mockResolvedValue(undefined);
+    const failure = new Error('insert into verification_runs failed: connection refused');
+    harness.insertRun.mockRejectedValue(failure);
+
+    await expect(harness.handler(JOB)).rejects.toBe(failure);
+
+    // The (idempotent) GitHub report already happened: the retry re-reports the
+    // same verdict and may insert the row again — the accepted v1 edge.
+    expect(harness.reportVerdict).toHaveBeenCalledTimes(1);
+    expect(harness.insertRun).toHaveBeenCalledTimes(1);
+    expect(harness.error).toHaveBeenCalledTimes(1);
+    const logged = firstMessage(harness.error);
+    expect(logged).toContain('failed to persist verification run');
+    expect(logged).toContain('octocat/hello-world#7');
+    expect(logged).toContain('connection refused');
+    // The success line must not claim a completed, recorded run.
     expect(
       messagesOf(harness.info).some((message) =>
         message.includes('reported verdict verified-fix'),
@@ -519,6 +742,7 @@ describe('createDifferentialHandler — missing installation id', () => {
 
     await expect(harness.handler({ ...JOB, installationId: null })).resolves.toBeUndefined();
 
+    expect(harness.lookupConfig).not.toHaveBeenCalled();
     expect(harness.prDiff).not.toHaveBeenCalled();
     expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
     expect(harness.fetchTextFile).not.toHaveBeenCalled();
@@ -526,6 +750,7 @@ describe('createDifferentialHandler — missing installation id', () => {
     expect(harness.repoTarball).not.toHaveBeenCalled();
     expect(harness.runner).not.toHaveBeenCalled();
     expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
 
     expect(harness.warn).toHaveBeenCalledTimes(1);
     const warning = firstMessage(harness.warn);

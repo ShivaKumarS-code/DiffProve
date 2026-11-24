@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import type { InstallationStore } from '../db/types.js';
 import type { ParsedWebhook } from './events.js';
 import { handleWebhookEvent, type WebhookDeps } from './handle-event.js';
 
@@ -24,6 +25,10 @@ interface SetupOptions {
   jobId?: string;
   enqueueError?: Error;
   checkRunError?: Error;
+  /** Pass `true` to simulate an environment without PostgreSQL configured. */
+  withoutInstallations?: boolean;
+  upsertError?: Error;
+  removeError?: Error;
 }
 
 /**
@@ -48,6 +53,24 @@ function setup(options: SetupOptions = {}) {
     }
   });
 
+  const upsertInstallation = vi.fn<InstallationStore['upsertInstallation']>(
+    async (): Promise<void> => {
+      calls.push('upsertInstallation');
+      if (options.upsertError) {
+        throw options.upsertError;
+      }
+    },
+  );
+
+  const removeInstallation = vi.fn<InstallationStore['removeInstallation']>(
+    async (): Promise<void> => {
+      calls.push('removeInstallation');
+      if (options.removeError) {
+        throw options.removeError;
+      }
+    },
+  );
+
   const logger = {
     info: vi.fn(),
     warn: vi.fn(),
@@ -57,10 +80,21 @@ function setup(options: SetupOptions = {}) {
   const deps: WebhookDeps = {
     enqueuer: { enqueue },
     checkPoster: { postQueuedCheckRun },
+    installations: options.withoutInstallations
+      ? null
+      : { upsertInstallation, removeInstallation },
     logger,
   };
 
-  return { calls, enqueue, postQueuedCheckRun, logger, deps };
+  return {
+    calls,
+    enqueue,
+    postQueuedCheckRun,
+    upsertInstallation,
+    removeInstallation,
+    logger,
+    deps,
+  };
 }
 
 describe('handleWebhookEvent', () => {
@@ -175,20 +209,143 @@ describe('handleWebhookEvent', () => {
       expect(logger.info).not.toHaveBeenCalled();
     });
 
-    it('acknowledges installation events and logs that persistence is pending', async () => {
-      const { enqueue, postQueuedCheckRun, logger, deps } = setup();
+    describe('installation', () => {
+      it('upserts the installation on created and answers 200', async () => {
+        const { enqueue, postQueuedCheckRun, upsertInstallation, removeInstallation, deps } =
+          setup();
 
-      const result = await handleWebhookEvent(
-        { kind: 'installation', action: 'created', installationId: 42, accountLogin: 'octocat' },
-        deps,
-      );
+        const result = await handleWebhookEvent(
+          { kind: 'installation', action: 'created', installationId: 42, accountLogin: 'octocat' },
+          deps,
+        );
 
-      expect(result).toEqual({ statusCode: 200, message: 'installation created acknowledged' });
-      expect(logger.info).toHaveBeenCalledWith(
-        'installation created acknowledged (persistence lands with the DB phase)',
-      );
-      expect(enqueue).not.toHaveBeenCalled();
-      expect(postQueuedCheckRun).not.toHaveBeenCalled();
+        expect(result).toEqual({ statusCode: 200, message: 'installation created acknowledged' });
+        expect(upsertInstallation).toHaveBeenCalledTimes(1);
+        expect(upsertInstallation).toHaveBeenCalledWith({
+          githubInstallationId: 42,
+          accountLogin: 'octocat',
+        });
+        expect(removeInstallation).not.toHaveBeenCalled();
+        // An installation event never touches the verification queue or checks.
+        expect(enqueue).not.toHaveBeenCalled();
+        expect(postQueuedCheckRun).not.toHaveBeenCalled();
+      });
+
+      it('upserts on new_permissions_accepted, including a missing account login', async () => {
+        const { upsertInstallation, deps } = setup();
+
+        const result = await handleWebhookEvent(
+          {
+            kind: 'installation',
+            action: 'new_permissions_accepted',
+            installationId: 42,
+            accountLogin: null,
+          },
+          deps,
+        );
+
+        expect(result).toEqual({
+          statusCode: 200,
+          message: 'installation new_permissions_accepted acknowledged',
+        });
+        expect(upsertInstallation).toHaveBeenCalledWith({
+          githubInstallationId: 42,
+          accountLogin: null,
+        });
+      });
+
+      it('removes the installation on deleted', async () => {
+        const { upsertInstallation, removeInstallation, deps } = setup();
+
+        const result = await handleWebhookEvent(
+          { kind: 'installation', action: 'deleted', installationId: 42, accountLogin: 'octocat' },
+          deps,
+        );
+
+        expect(result).toEqual({ statusCode: 200, message: 'installation deleted acknowledged' });
+        expect(removeInstallation).toHaveBeenCalledTimes(1);
+        expect(removeInstallation).toHaveBeenCalledWith(42);
+        expect(upsertInstallation).not.toHaveBeenCalled();
+      });
+
+      it('acknowledges suspend and unsuspend without touching the store', async () => {
+        const { upsertInstallation, removeInstallation, logger, deps } = setup();
+
+        for (const action of ['suspend', 'unsuspend']) {
+          const result = await handleWebhookEvent(
+            {
+              kind: 'installation',
+              action,
+              installationId: 42,
+              accountLogin: 'octocat',
+            },
+            deps,
+          );
+
+          expect(result).toEqual({
+            statusCode: 200,
+            message: `installation ${action} acknowledged`,
+          });
+        }
+
+        expect(upsertInstallation).not.toHaveBeenCalled();
+        expect(removeInstallation).not.toHaveBeenCalled();
+        expect(logger.info).toHaveBeenCalledTimes(2);
+        expect(logger.error).not.toHaveBeenCalled();
+      });
+
+      it('keeps the log-only behavior when no store is configured', async () => {
+        const { upsertInstallation, removeInstallation, logger, deps } = setup({
+          withoutInstallations: true,
+        });
+
+        const result = await handleWebhookEvent(
+          { kind: 'installation', action: 'created', installationId: 42, accountLogin: 'octocat' },
+          deps,
+        );
+
+        expect(result).toEqual({ statusCode: 200, message: 'installation created acknowledged' });
+        expect(upsertInstallation).not.toHaveBeenCalled();
+        expect(removeInstallation).not.toHaveBeenCalled();
+        expect(logger.info).toHaveBeenCalledTimes(1);
+        expect(logger.error).not.toHaveBeenCalled();
+      });
+
+      it('still answers 200 and logs when the upsert fails', async () => {
+        const { upsertInstallation, logger, deps } = setup({
+          upsertError: new Error('postgres unavailable'),
+        });
+
+        const result = await handleWebhookEvent(
+          { kind: 'installation', action: 'created', installationId: 42, accountLogin: 'octocat' },
+          deps,
+        );
+
+        // Installation rows are an optimization: GitHub must not retry the
+        // delivery because the database was briefly unavailable.
+        expect(result).toEqual({ statusCode: 200, message: 'installation created acknowledged' });
+        expect(upsertInstallation).toHaveBeenCalledTimes(1);
+        expect(logger.error).toHaveBeenCalledTimes(1);
+        const logged = String(logger.error.mock.calls[0]?.[0] ?? '');
+        expect(logged).toContain('failed to persist installation created');
+        expect(logged).toContain('42');
+        expect(logged).toContain('postgres unavailable');
+      });
+
+      it('still answers 200 when the delete fails', async () => {
+        const { removeInstallation, logger, deps } = setup({
+          removeError: new Error('postgres unavailable'),
+        });
+
+        const result = await handleWebhookEvent(
+          { kind: 'installation', action: 'deleted', installationId: 42, accountLogin: 'octocat' },
+          deps,
+        );
+
+        expect(result).toEqual({ statusCode: 200, message: 'installation deleted acknowledged' });
+        expect(removeInstallation).toHaveBeenCalledTimes(1);
+        expect(logger.error).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('ignores unhandled events', async () => {

@@ -28,6 +28,7 @@ function fullEnv(): Record<string, string | undefined> {
   return {
     PORT: '8080',
     REDIS_URL: 'rediss://redis.internal:6380',
+    DATABASE_URL: 'postgresql://diffprove:placeholder@db.internal:5432/diffprove',
     GITHUB_APP_ID: '987654',
     GITHUB_PRIVATE_KEY: FAKE_PEM,
     GITHUB_WEBHOOK_SECRET: 'placeholder-webhook-secret',
@@ -59,6 +60,7 @@ describe('loadConfig with valid input', () => {
     expect(config).toEqual({
       port: 8080,
       redisUrl: 'rediss://redis.internal:6380',
+      databaseUrl: 'postgresql://diffprove:placeholder@db.internal:5432/diffprove',
       githubAppId: '987654',
       githubPrivateKey: FAKE_PEM,
       webhookSecret: 'placeholder-webhook-secret',
@@ -70,11 +72,12 @@ describe('loadConfig with valid input', () => {
     });
   });
 
-  it('applies defaults for PORT, REDIS_URL and LOG_LEVEL when omitted', () => {
+  it('applies defaults for PORT, REDIS_URL, DATABASE_URL and LOG_LEVEL when omitted', () => {
     const config = loadConfig(requiredEnv());
 
     expect(config.port).toBe(3000);
     expect(config.redisUrl).toBe('redis://127.0.0.1:6379');
+    expect(config.databaseUrl).toBeNull();
     expect(config.logLevel).toBe('info');
   });
 
@@ -375,5 +378,61 @@ describe('loadConfig — invalid E2B settings', () => {
     expect(error.message).toContain('E2B_TEST_TIMEOUT_MS');
     expect(error.message).not.toContain(bogusApiKey);
     expect(error.message).not.toContain('E2B_API_KEY');
+  });
+});
+
+describe('loadConfig — DATABASE_URL', () => {
+  it('defaults to null when unset (persistence disabled)', () => {
+    expect(loadConfig(requiredEnv()).databaseUrl).toBeNull();
+  });
+
+  it('treats a blank value as unset', () => {
+    expect(loadConfig({ ...requiredEnv(), DATABASE_URL: '   ' }).databaseUrl).toBeNull();
+    expect(loadConfig({ ...requiredEnv(), DATABASE_URL: '' }).databaseUrl).toBeNull();
+  });
+
+  it.each(['postgres://user:pass@host:5432/db', 'postgresql://user:pass@host/db'])(
+    'accepts the PostgreSQL URL %j',
+    (url) => {
+      expect(loadConfig({ ...requiredEnv(), DATABASE_URL: url }).databaseUrl).toBe(url);
+    },
+  );
+
+  it('trims surrounding whitespace', () => {
+    const url = 'postgresql://diffprove:diffprove@127.0.0.1:5432/diffprove';
+
+    expect(loadConfig({ ...requiredEnv(), DATABASE_URL: `  ${url}  ` }).databaseUrl).toBe(url);
+  });
+
+  it('rejects a non-PostgreSQL URL and names DATABASE_URL', () => {
+    const error = captureConfigError({ ...requiredEnv(), DATABASE_URL: 'mysql://x' });
+
+    expect(error.name).toBe('ConfigError');
+    expect(error.message).toContain('DATABASE_URL');
+    expect(error.message).not.toContain('GITHUB_PRIVATE_KEY');
+  });
+
+  it('never leaks credentials embedded in an invalid DATABASE_URL', () => {
+    const error = captureConfigError({
+      ...requiredEnv(),
+      DATABASE_URL: 'mysql://admin:hunter3@db.example:3306/app',
+    });
+
+    expect(error.message).toContain('DATABASE_URL');
+    expect(error.message).not.toContain('hunter3');
+    expect(error.message).not.toContain('mysql://admin');
+    expect(error.message).not.toContain('db.example');
+  });
+
+  it('aggregates a bad DATABASE_URL with other problems into one ConfigError', () => {
+    const error = captureConfigError({
+      ...requiredEnv(),
+      DATABASE_URL: 'mysql://x',
+      PORT: 'nope',
+    });
+
+    expect(error.message).toContain('Invalid environment configuration');
+    expect(error.message).toContain('PORT');
+    expect(error.message).toContain('DATABASE_URL');
   });
 });
