@@ -1,78 +1,77 @@
-# Phase 3 Execution Plan — E2B Differential Runner
+# Phase 4 Execution Plan — Verdict Reporting & Dashboard
 
-Scope source: `docs/architecture.md`, heading **"MVP Build Phases"**, Phase 3 line:
+Scope source: `docs/architecture.md`, heading **"MVP Build Phases"**, Phase 4 line:
 
-> **Phase 3 (E2B Differential Runner):** Implement Firecracker sandbox execution for Run A and Run B with network egress disabled during test execution and lockfile-keyed snapshot caching.
+> **Phase 4 (Verdict Reporting & Dashboard):** Map Run A/B exit codes to rich GitHub Check Run reports and build the Next.js history/config UI.
 
 Also touches these parts of `docs/architecture.md`:
-- Heading **"End-to-End Verification Pipeline"** — step 3 (Sandbox Provisioning: E2B, cached snapshot keyed by lockfile hash, egress disabled before untrusted code), step 4 (Run A: base + Test-Only Patch, targeted tests, expect FAIL), step 5 (Run B: full patch, same command, expect PASS), and step 6's verdict matrix used as the *pipeline's internal classification* (basic conclusion + one-line summary; the *rich* Markdown reports are Phase 4).
-- Heading **"Component Architecture & Stack"** — rows `Sandbox Runner` (E2B) and `Env Snapshot Cache` (E2B snapshots + Redis metadata).
-- Heading **"Key Engineering Guardrails"** — #1 (v1 scope: pytest / vitest / jest, auto-detect from `pyproject.toml` / `package.json`), #2 (egress disabled after dependency install, **no GitHub tokens ever enter the sandbox**), #3 (new-feature ImportError classified distinctly), #4 (lockfile-hash snapshot caching for fast repeat runs).
-- **NOT touched in Phase 3:** the `Core Data Model` tables and the rich Check Run Markdown reports + dashboard (Phase 4: "Map Run A/B exit codes to rich GitHub Check Run reports and build the Next.js history/config UI").
+- Heading **"End-to-End Verification Pipeline"** — step 6 in full: "The worker updates the GitHub Check Run with a structured Markdown summary, clipped stdout/stderr excerpts from Run A and Run B, and saves the record to PostgreSQL." And step 2's "repo-configured test globs" — now backed by the `repositories` table instead of hard defaults.
+- Heading **"Core Data Model"** — all four PostgreSQL tables (`installations`, `repositories`, `env_snapshots`, `verification_runs`) exactly as specified.
+- Heading **"Component Architecture & Stack"** — rows `Run History DB` (PostgreSQL) and `Web Dashboard` (Next.js + Tailwind CSS: repo onboarding, custom test commands, verification history & logs).
+- Heading **"API & Interface Contracts"** — `GET /api/repos/:id/runs` (history + weak-test catch rate) and `PATCH /api/repos/:id/config` (override auto-detected `test_command` / `test_file_globs`).
+- Heading **"Key Engineering Guardrails"** — #2 unchanged (tokens never in sandboxes/logs; DB credentials never echoed).
 
 ## Design decisions
 
-- **Token-free provisioning:** the worker (trusted side) downloads the base tree as a tarball (`GET /repos/{owner}/{repo}/tarball/{ref}`) with the installation token and uploads it into the sandbox via the files API. The token never crosses the sandbox boundary; the sandbox never clones from GitHub.
-- **Git-free patching:** the tarball is extracted to `/workspace`; each run copies the pristine tree (`cp -a`) and applies its patch with `git apply` (usable outside a repo). Run A = `/run-a` + Test-Only Patch; Run B = `/run-b` + Full PR Patch.
-- **Egress lockdown:** installs run with egress open; then a single `sandbox.updateNetwork({ denyOut: ['0.0.0.0/0'] })` before the *test* commands — the flow the architecture mandates. Lockdown failure aborts the runs as environment failure.
-- **Snapshot caching (real, keyed):** on a cache miss the runner installs base dependencies, then `sandbox.createSnapshot('diffprove-<lockfileKey>')` and records the ref in Redis (`diffprove:env-snapshots:<repo>~<key>`). On a hit the sandbox boots from the snapshot: Node deps (`node_modules`) are rescued from the snapshot tree, the pristine base is re-extracted (the snapshot's tree is stale per-PR), and deps are restored; Python deps live in global site-packages and survive the reset. Reinstall for Run B happens only when the head lockfile hash differs from base.
-- **Raw results in, classified out:** the E2B runner returns *raw* results (exit code, stdout/stderr, timedOut, duration); classification and verdict mapping are pure functions in `src/runner/` so the whole differential policy is unit-tested without E2B.
-- **Verdict reporting in Phase 3 is intentionally plain:** completed check run with the matrix conclusion (`success` / `failure` / `neutral`) + one-line title/summary. Phase 4 upgrades it to rich Markdown with clipped logs and annotations.
+- **PostgreSQL via `pg` + a tiny SQL migration runner** — no ORM, consistent with the dependency-light stack. `DATABASE_URL` is optional (same graceful-degradation pattern as `E2B_API_KEY`): without it the pipeline runs as in Phase 3 and the API answers 503.
+- **The Fastify service owns `/api/*`** — the architecture lists repo config and runs endpoints under the server's responsibilities; the Next.js app is a pure frontend that calls them (`NEXT_PUBLIC_API_URL`). Root `package.json` becomes an npm **workspace root** with the service staying as the root package and `apps/web` as a member — no disruptive move of the verified service.
+- **Rich report, same conclusions:** the renderer produces the structured Markdown (verdict header, the matrix row that fired, Run A / Run B sections with clipped log excerpts). `new-symbol` stays `neutral` per the matrix's allowed column, now with the annotation the matrix's "(Annotated)" calls for.
+- **Repo config drives the worker:** `test_file_globs` overrides the default globs in `splitDiff`; `test_command` overrides the auto-detected targeted command; `enabled=false` leaves a job queued with a warning. Every completed differential is persisted to `verification_runs`; installation webhook events now upsert/remove `installations` rows (the Phase 1 "persistence lands with the DB phase" promise).
+- **`env_snapshots`** is created per the Core Data Model but stays metadata-only in v1 (the live snapshot cache remains Redis-backed from Phase 3); the worker records snapshot usage there when a repository row exists.
 
 ## Pieces (one subagent per piece, disjoint files)
 
 | # | Piece | Files owned | Architecture headings touched |
 |---|-------|--------------|-------------------------------|
-| 0 | Plan, contracts, dependency install, server wiring, consolidated commits | `PLAN.md`, `src/runner/types.ts`, `src/server.ts`, `README.md` | glue |
-| 1 | Pure runner core | `src/runner/detect.ts`, `src/runner/classify.ts`, `src/runner/commands.ts`, `src/runner/matrix.ts` + 4 test files | Pipeline step 4-6, Guardrails #1/#3 |
-| 2 | E2B runner + snapshot cache | `src/runner/e2b-sandbox.ts` (thin SDK adapter), `src/runner/e2b-runner.ts`, `src/runner/snapshot-cache.ts` + tests | Pipeline step 3-5, Guardrails #2/#4 |
-| 3 | GitHub clients: repo content, tarball, verdict reporter | `src/github/repo-content.ts`, `src/github/repo-tarball.ts`, `src/github/verdict-report.ts` (+ small refactor of `src/github/check-runs.ts` to share the find-check-run helper) + tests | Pipeline steps 3-6, API & Interface Contracts |
-| 4 | Differential worker handler + config extension | `src/queue/differential-handler.ts` + test, `src/config.ts`, `src/config.test.ts`, `.env.example` | Pipeline steps 2-6, Job Orchestrator row |
-| 5 | CI | `.github/workflows/ci.yml` (no change expected — suite grows automatically) | — |
+| 0 | Plan, DB/report/API contracts, workspace glue, server wiring, commits | `PLAN.md`, `src/db/types.ts`, `src/runner/types.ts` (report input — with piece 2), root `package.json`, `docker-compose.yml`, `.github/workflows/ci.yml`, `src/server.ts`, `README.md`, `.env.example` | glue |
+| 1 | DB layer: pool, migrations, stores | `src/db/pool.ts`, `src/db/migrate.ts`, `src/db/migrations/001_init.sql`, `src/db/installations.ts`, `src/db/repositories.ts`, `src/db/verification-runs.ts`, `src/db/db.test.ts` (DATABASE_URL-gated) | Core Data Model, Run History DB row |
+| 2 | Rich report renderer + GitHub reporter upgrade | `src/runner/report.ts`, `src/runner/report.test.ts`, `src/runner/matrix.ts` + `matrix.test.ts` (describeVerdict → renderer), `src/runner/types.ts` (VerdictReportInput gains prNumber + run outcomes), `src/github/verdict-report.ts` + `verdict-report.test.ts` | Pipeline step 6 (structured Markdown, clipped excerpts) |
+| 3 | Worker integration: repo config, persistence, installation events | `src/queue/differential-handler.ts` + test, `src/webhooks/handle-event.ts` + test, `src/config.ts` + `config.test.ts` (DATABASE_URL), `.env.example` | Pipeline steps 2 & 6, Core Data Model |
+| 4 | Fastify API routes | `src/api/routes.ts`, `src/app.ts`, `src/app.test.ts` | API & Interface Contracts (runs/config endpoints) |
+| 5 | Next.js dashboard (orchestrator pre-installs workspace deps) | `apps/web/next.config.mjs`, `postcss.config.mjs`, `tsconfig.json`, `apps/web/src/**` | Web Dashboard row |
 
-Waves: 1 ∥ 2 (both depend only on the shared contracts in piece 0), then 3 ∥ 4, then orchestrator wiring.
+Waves: 1 (db) ∥ 2 (report) → 3 ∥ 4 ∥ 5 → orchestrator wiring.
 
-## Shared contracts (piece 0 creates `src/runner/types.ts` before wave 1)
+## Contracts (piece 0 creates `src/db/types.ts`; pieces import from it)
 
 ```ts
-export type RunnerKind = 'pytest' | 'vitest' | 'jest';
-export interface SandboxRawResult { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean; durationMs: number }
-export interface DifferentialRawResult { runA: SandboxRawResult; runB: SandboxRawResult }
-export interface DifferentialRunRequest { repoFullName: string; baseSha: string; headSha: string; tarball: Uint8Array; testOnlyDiff: string; fullDiff: string; testCommand: string; installCommand: string | null; headInstallCommand: string | null; runnerKind: RunnerKind; lockfileKey: string }
-export type DifferentialRunner = (request: DifferentialRunRequest) => Promise<DifferentialRawResult>;
-export type RunStatus = 'pass' | 'fail' | 'import-error' | 'syntax-error' | 'timeout' | 'error';
-export interface SandboxRunOutcome { status: RunStatus; exitCode: number | null; durationMs: number; logExcerpt: string }
-export type Verdict = 'verified-fix' | 'weak-test' | 'broken-implementation' | 'new-symbol' | 'environment-failure';
-export interface SandboxHandle { run(...): Promise<SandboxRawResult>; writeFile(...): Promise<void>; updateNetworkEgress(denyAll: boolean): Promise<void>; createSnapshot(name: string): Promise<string | null>; close(): Promise<void> }
-export interface SandboxFactory { create(opts: { templateId?: string; apiKey?: string; timeoutMs?: number }): Promise<SandboxHandle> }
-export interface EnvSnapshotCache { get(repoFullName: string, lockfileKey: string): Promise<string | null>; set(repoFullName: string, lockfileKey: string, templateRef: string): Promise<void> }
-export interface RepoContentClient { fetchTextFile(input: { repoFullName: string; path: string; ref: string; installationId: number }): Promise<string | null>; listPaths(input: { repoFullName: string; ref: string; installationId: number }): Promise<string[]> }
-export type RepoTarballClient = (input: { repoFullName: string; ref: string; installationId: number }) => Promise<Uint8Array>;
-export interface VerdictReportInput { repoFullName: string; headSha: string; installationId: number; verdict: Verdict; conclusion: 'success' | 'failure' | 'neutral'; title: string; summary: string; durationMs: number }
-export interface VerdictReporter { reportVerdict(report: VerdictReportInput): Promise<void> }
+export interface RepositoryRow { id: string; installationId: string | null; repoFullName: string; language: 'python' | 'node' | null; testCommand: string | null; testFileGlobs: string[] | null; enabled: boolean; createdAt: Date; }
+export interface VerificationRunRow { id: string; repositoryId: string; prNumber: number; baseSha: string; headSha: string; changedTestFiles: string[]; runAStatus: string; runBStatus: string; verdict: string; durationMs: number; runALog: string; runBLog: string; createdAt: Date; }
+export interface RunHistorySummary { runs: VerificationRunRow[]; totalRuns: number; weakTestCount: number; catchRate: number | null; } // catchRate = weak-test / total, null when no runs
+export interface InstallationRecord { githubInstallationId: number; accountLogin: string | null; }
+export interface InstallationStore { upsertInstallation(record: InstallationRecord): Promise<void>; removeInstallation(githubInstallationId: number): Promise<void>; }
+export interface RepositoryStore { ensureRepository(input: { repoFullName: string; installationId: number | null; language: 'python' | 'node' }): Promise<RepositoryRow>; getRepository(id: string): Promise<RepositoryRow | null>; listRepositories(): Promise<RepositoryRow[]>; updateRepositoryConfig(id: string, config: { testCommand?: string | null; testFileGlobs?: string[] | null; enabled?: boolean }): Promise<RepositoryRow | null>; }
+export interface VerificationRunStore { insertRun(run: VerificationRunInsert): Promise<void>; listRuns(repositoryId: string, limit?: number): Promise<RunHistorySummary>; }
+export interface VerificationRunInsert { repoFullName: string; installationId: number | null; language: 'python' | 'node'; prNumber: number; baseSha: string; headSha: string; changedTestFiles: string[]; runAStatus: string; runBStatus: string; verdict: string; durationMs: number; runALog: string; runBLog: string; }
+export interface RepoConfig { testFileGlobs: string[] | null; testCommand: string | null; enabled: boolean; }
+export interface RepoConfigStore { lookupConfig(repoFullName: string): Promise<RepoConfig | null>; } // null = not configured → defaults
 ```
 
-Piece 1: `detectRunner({ packageJson?, pyprojectToml? }): { kind: RunnerKind } | null` (vitest > jest from package.json deps/scripts, else pytest from pyproject, else null); `classifyRun(raw, kind): SandboxRunOutcome` (timeout > exit 0 pass > exit 127 or null error > import/syntax patterns > fail; 4000-char clipped excerpt); `buildInstallCommand(files, kind)`, `buildTestCommand(kind, files)`, `findLockfile(files)`; `verdictFrom(a, b): Verdict` (the architecture's matrix), `conclusionForVerdict`, `describeVerdict`.
+Report contracts (piece 2 extends `src/runner/types.ts`): `VerdictReportInput` gains `prNumber: number`, `runA: SandboxRunOutcome`, `runB: SandboxRunOutcome`; the renderer `buildVerdictReport(verdict, a, b, ctx)` in `src/runner/report.ts` returns `{ title, summary }` (Markdown).
 
-Piece 2: `createE2bSandboxFactory()` — thin adapter over `@e2b/code-interpreter`'s `Sandbox` (the agent reads the shipped `.d.ts` for exact option names); `createE2bDifferentialRunner({ sandboxFactory, apiKey?, defaultTemplateId?, snapshotCache?, logger, installTimeoutMs?, testTimeoutMs? })` with the exact command sequence from the design decisions; `createRedisSnapshotCache(redisUrl)` (own ioredis client, `diffprove:env-snapshots:*` keys, integration test gated on `REDIS_URL`).
+Piece 1: `createPgPool(databaseUrl)` (pg Pool + close), `runMigrations(pool)` (applies `migrations/*.sql` once, recorded in `schema_migrations`), and the three stores implementing the ports with parameterized SQL. Integration tests gated behind `DATABASE_URL` (CI runs a postgres service; locally skipped).
 
-Piece 3: `createRepoContentClient` (contents API for text files — base64-decode, 404 → null; recursive git trees for path lists), `createRepoTarballClient` (tarball endpoint → `Uint8Array`), `createVerdictReporter` (find-or-create the DiffProve check run, PATCH to completed with conclusion + output). All installation-token per request, token-free errors, same style as Phase 1/2.
+Piece 2: pure `report.ts` (Markdown: verdict statement, fired matrix row, `### Run A / Run B` sections with clipped `logExcerpt` in `<details>`), replacing `describeVerdict`; `src/github/verdict-report.ts` passes the richer fields through unchanged (title/summary verbatim).
 
-Piece 4: `createDifferentialHandler(deps)` — Phase 2's short-circuit retained (no test changes → neutral report); then: fetch manifests at base → detect runner (none → throw for BullMQ retry); list base/head paths; build install/test commands; compute lockfile keys (sha256 of lockfile content, 'none' if absent); fetch base tarball; run the differential; classify both runs; map the verdict; report it. `runner: null` (no `E2B_API_KEY`) → warn + leave queued. Config gains optional `E2B_API_KEY`, `E2B_TEMPLATE_ID`, `E2B_TEST_TIMEOUT_MS` (default 120000), `E2B_INSTALL_TIMEOUT_MS` (default 240000).
+Piece 3: the differential handler — repo config lookup before splitting (globs override; `test_command` override; `enabled=false` → warn + leave queued), run persistence after the verdict (including `logExcerpt`s as `run_a_log`/`run_b_log`), and the installation webhook handler persists `installation` events through an optional `InstallationStore`. Config gains optional `DATABASE_URL` (postgres:// or postgresql:// scheme).
 
-Piece 0 wiring (orchestrator): `src/server.ts` composes the E2B runner (only when `E2B_API_KEY` is set), the snapshot cache, the new GitHub clients, and swaps the worker handler to `createDifferentialHandler`. The Phase-2 `diff-handler.ts` is removed in the same consolidated commit (superseded by the differential handler, which contains its short-circuit).
+Piece 4: `registerApiRoutes(app, deps)` — `GET /api/repos`, `GET /api/repos/:id/runs?limit=`, `PATCH /api/repos/:id/config` with zod-validated bodies, 404s for unknown ids, 503 when no stores are wired.
 
-## Branches & commits (consolidated per user instruction)
+Piece 5: Next.js (App Router, client components) + Tailwind — `/` lists repositories; `/repos/[id]` shows the run history (verdict badges, catch rate, collapsible logs) and the config form (test command, globs, enabled) PATCHing the API. Proof: `npm run build -w apps/web`.
 
-- `main`: Phase 3 plan; (at the end) the merged Phase 3 branch.
-- `feature/phase-3-differential-runner`: a handful of *capability-level* commits, not per-file commits:
-  1. `feat(runner): detection, run classification, and verdict matrix core` (contracts + piece 1)
-  2. `feat(sandbox): E2B differential runner with egress lockdown and snapshot cache` (piece 2)
-  3. `feat(worker): end-to-end differential pipeline with verdict reporting` (pieces 3+4, server wiring, superseded handler removal, README status)
-- Merge to `main` with a `--no-ff` merge commit. Any small review fixes fold into the commit they belong to before committing.
-- `AGENTS.md` stays **local-only** (`.git/info/exclude`; never committed).
+## Branches & commits (consolidated)
+
+- `main`: Phase 4 plan; (at the end) the merged branch + push.
+- `feature/phase-4-verdict-dashboard`, capability-level commits:
+  1. `feat(db): PostgreSQL schema, migrations, and stores`
+  2. `feat(report): rich verdict reports with clipped run logs`
+  3. `feat(worker): repo-configured globs, run persistence, installation records`
+  4. `feat(api): repo history and config endpoints`
+  5. `feat(web): Next.js verification dashboard` (workspace + app)
+  6. `feat(server): compose database, rich reports, and API` (+ README status)
+- Merge `--no-ff`, push to origin. `AGENTS.md` stays local-only.
 
 ## Verification
 
-- Each subagent proves its piece with scoped `npx vitest run <files>`; the orchestrator reviews every diff and runs the full gate itself: `npm run typecheck && npm test && npm run lint && npm run build`.
-- Unverified locally (no E2B account, no GitHub installation, no Docker/Redis on this machine): any live E2B sandbox interaction (boot, commands, snapshots, updateNetwork) — the adapter is thin and every behavior around it is fake-tested; live GitHub tarball/contents/trees; Redis round-trip (CI runs it with the service container).
+- Scoped per-piece vitest/eslint by subagents; orchestrator reviews every diff and runs the full gate (`typecheck`, `test`, `lint`, `build`) plus the dashboard build and a boot smoke.
+- Unverified locally (no Docker/Postgres, no live GitHub, no browser): PG round-trips (CI runs them with a service container), live check-run PATCH rendering, dashboard visual rendering (build-verified only).
