@@ -13,7 +13,7 @@ See [docs/architecture.md](docs/architecture.md) for the full system design and
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | GitHub App & webhook ingestion (HMAC verification, `queued` check runs, BullMQ queue) | complete |
-| 2 | Diff splitter (test-only vs full patches) | pending |
+| 2 | Diff splitter (test-only vs full patches, no-test-changes short-circuit) | complete |
 | 3 | E2B differential sandbox runner (Run A / Run B) | pending |
 | 4 | Verdict reporting & dashboard | pending |
 
