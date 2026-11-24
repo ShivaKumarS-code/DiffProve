@@ -102,6 +102,9 @@ export interface PrDiffRequest {
  */
 export type PrDiffClient = (request: PrDiffRequest) => Promise<string>;
 
+/** Check-run output title for the pure-refactor short-circuit (pipeline step 2). */
+export const NO_TEST_CHANGES_TITLE = 'No test changes detected to verify';
+
 /** Input for the no-test-changes short-circuit report on a PR head commit. */
 export interface NoTestChangesReport {
   repoFullName: string;
