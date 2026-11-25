@@ -10,8 +10,8 @@
  *
  * Steps 4-5: both runs execute "the exact same targeted test command"
  * (`pytest <changed_tests>` or `vitest run <changed_tests>`). Paths come from
- * the PR diff and are therefore always double-quoted so a directory with a
- * space cannot change the command's meaning.
+ * the PR diff and are therefore always POSIX single-quoted so spaces or shell
+ * metacharacters cannot change the command's meaning.
  *
  * Pure module: no I/O, no shell execution, no sandbox knowledge.
  */
@@ -74,6 +74,14 @@ export function findLockfile(files: readonly string[]): { name: string; path: st
 }
 
 /**
+ * POSIX single-quotes `arg` so `/bin/sh` passes it literally without expanding
+ * `$(...)`, backticks, `"`, `$VAR`, or splitting on whitespace.
+ */
+export function quoteShellArg(arg: string): string {
+  return `'${arg.replaceAll("'", "'\\''")}'`;
+}
+
+/**
  * Builds the dependency install command for `kind` from the repo's files.
  *
  * Returns null when there is nothing to install from (e.g. a bare package.json
@@ -83,16 +91,16 @@ export function findLockfile(files: readonly string[]): { name: string; path: st
 export function buildInstallCommand(files: readonly string[], kind: RunnerKind): string | null {
   if (kind === 'pytest') {
     // Python installers, most reproducible first. A requirements.txt path may
-    // be nested, so the matched path is used verbatim.
+    // be nested, so the matched path is POSIX single-quoted.
     if (findFile(files, 'uv.lock') !== null) {
       return 'uv sync';
     }
     if (findFile(files, 'poetry.lock') !== null) {
-      return 'poetry install';
+      return 'POETRY_VIRTUALENVS_IN_PROJECT=true poetry install';
     }
     const requirements = findFile(files, 'requirements.txt');
     if (requirements !== null) {
-      return `pip install -r ${requirements}`;
+      return `pip install -r ${quoteShellArg(requirements)}`;
     }
     if (findFile(files, 'pyproject.toml') !== null) {
       return 'pip install -e .';
@@ -119,11 +127,11 @@ export function buildInstallCommand(files: readonly string[], kind: RunnerKind):
 /**
  * Builds the targeted test command shared by Run A and Run B.
  *
- * Every path is double-quoted. An empty file list produces the runner's
+ * Every path is POSIX single-quoted. An empty file list produces the runner's
  * default invocation with no trailing space.
  */
 export function buildTestCommand(kind: RunnerKind, testFiles: readonly string[]): string {
-  const quoted = testFiles.map((file) => `"${file}"`).join(' ');
+  const quoted = testFiles.map(quoteShellArg).join(' ');
 
   switch (kind) {
     case 'pytest':
@@ -133,4 +141,22 @@ export function buildTestCommand(kind: RunnerKind, testFiles: readonly string[])
     case 'jest':
       return quoted === '' ? 'npx jest' : `npx jest ${quoted}`;
   }
+}
+
+/**
+ * Formats a custom `testCommand` override with POSIX single-quoted `testFiles`.
+ *
+ * Replaces `{files}` and `{file}` placeholders when present; otherwise returns
+ * `template` verbatim.
+ */
+export function formatCustomTestCommand(template: string, testFiles: readonly string[]): string {
+  if (!template.includes('{files}') && !template.includes('{file}')) {
+    return template;
+  }
+
+  const joined = testFiles.map(quoteShellArg).join(' ');
+  const formatted = template
+    .replaceAll('{files}', () => joined)
+    .replaceAll('{file}', () => joined);
+  return testFiles.length === 0 ? formatted.trimEnd() : formatted;
 }

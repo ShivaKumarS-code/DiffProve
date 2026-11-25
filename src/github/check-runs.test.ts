@@ -66,6 +66,8 @@ describe('createCheckRunReporter', () => {
       owner: 'octocat',
       repo: 'hello-world',
       ref: 'head456',
+      check_name: CHECK_RUN_NAME,
+      per_page: 100,
       headers: { authorization: 'token ghs_x' },
     });
 

@@ -71,6 +71,19 @@ const SNAPSHOT_TEST_DIFF = [
   '+',
 ].join('\n');
 
+/** A PR that only deletes a test file (has test changes, but zero runnable tests). */
+const DELETED_TEST_DIFF = [
+  'diff --git a/tests/test_gone.py b/tests/test_gone.py',
+  'deleted file mode 100644',
+  'index 3333333..0000000',
+  '--- a/tests/test_gone.py',
+  '+++ /dev/null',
+  '@@ -1,2 +0,0 @@',
+  '-def test_old():',
+  '-    assert True',
+  '',
+].join('\n');
+
 /** A `repositories` row with no overrides (the defaults apply). */
 const DEFAULT_REPO_CONFIG: RepoConfig = {
   testFileGlobs: null,
@@ -321,6 +334,32 @@ describe('createDifferentialHandler — no test changes', () => {
       'split: 1 file(s) changed, 0 test file(s), 0 runnable: (none)',
     );
   });
+
+  it('short-circuits deleted-only test PRs as neutral without running the suite', async () => {
+    const harness = buildHarness();
+    harness.prDiff.mockResolvedValue(DELETED_TEST_DIFF);
+
+    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+
+    expect(harness.reportNoTestChanges).toHaveBeenCalledTimes(1);
+    const report = harness.reportNoTestChanges.mock.calls[0]?.[0];
+    expect(report).toMatchObject({
+      repoFullName: 'octocat/hello-world',
+      headSha: 'head456',
+      installationId: 42,
+      title: NO_TEST_CHANGES_TITLE,
+    });
+    expect(report?.summary).toContain('tests/test_gone.py');
+    expect(report?.summary).toContain('deleted or binary');
+    expect(report?.summary).toContain('no runnable tests');
+
+    expect(harness.fetchTextFile).not.toHaveBeenCalled();
+    expect(harness.listPaths).not.toHaveBeenCalled();
+    expect(harness.repoTarball).not.toHaveBeenCalled();
+    expect(harness.runner).not.toHaveBeenCalled();
+    expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
+  });
 });
 
 describe('createDifferentialHandler — repository disabled', () => {
@@ -427,11 +466,113 @@ describe('createDifferentialHandler — repo-configured test command', () => {
     await harness.handler(JOB);
 
     const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
-    // The auto-detected command would be `npx vitest run "tests/app.test.ts"`.
+    // The auto-detected command would be `npx vitest run 'tests/app.test.ts'`.
     expect(request?.testCommand).toBe('npm test -- --runInBand');
     // Everything else about the run request is unchanged.
     expect(request?.installCommand).toBe('npm ci');
     expect(request?.runnerKind).toBe('vitest');
+  });
+
+  it('substitutes single-quoted runnable test paths for {files} and {file}', async () => {
+    for (const template of ['npm test -- {files}', 'npx vitest run {file}']) {
+      const harness = buildHarness({
+        repoConfig: { ...DEFAULT_REPO_CONFIG, testCommand: template },
+      });
+      givenVitestRepo(harness);
+      harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
+      harness.reportVerdict.mockResolvedValue(undefined);
+
+      await harness.handler(JOB);
+
+      const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
+      const expectedPrefix = template.replace(/\{files?\}$/, '');
+      expect(request?.testCommand).toBe(`${expectedPrefix}'tests/app.test.ts'`);
+    }
+  });
+
+  it('infers the runner instead of throwing when a custom testCommand is set and manifests lack a runner', async () => {
+    const cases: Array<{
+      testCommand: string;
+      packageJson: string | null;
+      pyprojectToml: string | null;
+      expectedRunner: 'pytest' | 'vitest' | 'jest';
+      expectedLanguage: 'python' | 'node';
+      expectedCommand: string;
+    }> = [
+      {
+        testCommand: 'python -m unittest {files}',
+        packageJson: null,
+        pyprojectToml: '[project]\nname = "demo"',
+        expectedRunner: 'pytest',
+        expectedLanguage: 'python',
+        expectedCommand: "python -m unittest 'tests/app.test.ts'",
+      },
+      {
+        testCommand: 'pytest -q {file}',
+        packageJson: null,
+        pyprojectToml: null,
+        expectedRunner: 'pytest',
+        expectedLanguage: 'python',
+        expectedCommand: "pytest -q 'tests/app.test.ts'",
+      },
+      {
+        testCommand: 'npx jest --runInBand {files}',
+        packageJson: '{}',
+        pyprojectToml: null,
+        expectedRunner: 'jest',
+        expectedLanguage: 'node',
+        expectedCommand: "npx jest --runInBand 'tests/app.test.ts'",
+      },
+      {
+        testCommand: 'npm run test:unit',
+        packageJson: '{"name":"demo","scripts":{"test":"echo custom"}}',
+        pyprojectToml: null,
+        expectedRunner: 'vitest',
+        expectedLanguage: 'node',
+        expectedCommand: 'npm run test:unit',
+      },
+      {
+        testCommand: 'make test',
+        packageJson: null,
+        pyprojectToml: '[project]\nname = "demo"',
+        expectedRunner: 'pytest',
+        expectedLanguage: 'python',
+        expectedCommand: 'make test',
+      },
+    ];
+
+    for (const c of cases) {
+      const harness = buildHarness({
+        repoConfig: { ...DEFAULT_REPO_CONFIG, testCommand: c.testCommand },
+      });
+      harness.prDiff.mockResolvedValue(MIXED_DIFF);
+      harness.fetchTextFile.mockImplementation(async ({ path }) => {
+        if (path === 'package.json') {
+          return c.packageJson;
+        }
+        if (path === 'pyproject.toml') {
+          return c.pyprojectToml;
+        }
+        return null;
+      });
+      harness.listPaths.mockResolvedValue([]);
+      harness.repoTarball.mockResolvedValue(TARBALL);
+      harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
+      harness.reportVerdict.mockResolvedValue(undefined);
+
+      await expect(harness.handler(JOB)).resolves.toBeUndefined();
+
+      const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
+      expect(request?.runnerKind).toBe(c.expectedRunner);
+      expect(request?.testCommand).toBe(c.expectedCommand);
+      expect(harness.insertRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          language: c.expectedLanguage,
+          verdict: 'verified-fix',
+        }),
+      );
+      expect(harness.error).not.toHaveBeenCalled();
+    }
   });
 });
 
@@ -486,7 +627,7 @@ describe('createDifferentialHandler — verified fix', () => {
       tarball: TARBALL,
       testOnlyDiff: TEST_ONLY_SECTION,
       fullDiff: MIXED_DIFF,
-      testCommand: 'npx vitest run "tests/app.test.ts"',
+      testCommand: "npx vitest run 'tests/app.test.ts'",
       installCommand: 'npm ci',
       headInstallCommand: null,
       runnerKind: 'vitest',

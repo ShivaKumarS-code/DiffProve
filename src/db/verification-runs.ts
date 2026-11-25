@@ -95,7 +95,16 @@ export function createVerificationRunStore(
         `insert into verification_runs (
            repository_id, pr_number, base_sha, head_sha, changed_test_files,
            run_a_status, run_b_status, verdict, duration_ms, run_a_log, run_b_log
-         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         on conflict (repository_id, pr_number, base_sha, head_sha) do update set
+           changed_test_files = excluded.changed_test_files,
+           run_a_status = excluded.run_a_status,
+           run_b_status = excluded.run_b_status,
+           verdict = excluded.verdict,
+           duration_ms = excluded.duration_ms,
+           run_a_log = excluded.run_a_log,
+           run_b_log = excluded.run_b_log,
+           created_at = now()`,
         [
           repository.id,
           run.prNumber,

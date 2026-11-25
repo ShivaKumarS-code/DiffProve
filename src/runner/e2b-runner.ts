@@ -91,6 +91,13 @@ function lockdownFailurePair(error: unknown): DifferentialRawResult {
   return { runA: { ...raw }, runB: { ...raw } };
 }
 
+/** Prepends the project's local `.venv/bin` to `PATH` when running `pytest`. */
+function testCommandForRun(request: DifferentialRunRequest): string {
+  return request.runnerKind === 'pytest'
+    ? `export PATH="$PWD/.venv/bin:$PATH"; ${request.testCommand}`
+    : request.testCommand;
+}
+
 export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRunner {
   const installTimeoutMs = deps.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
   const testTimeoutMs = deps.testTimeoutMs ?? DEFAULT_TEST_TIMEOUT_MS;
@@ -123,16 +130,12 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
       if (cached !== null) {
         // Snapshot HIT: /workspace holds the tree of the PR that produced the
         // snapshot (stale) but its dependency environment matches this lockfile
-        // hash (valid). Reset the tree and carry the dependencies over.
-        if (request.runnerKind === 'pytest') {
-          // Python deps live in global site-packages, so dropping /workspace is safe.
-          await sandbox.run(`rm -rf ${WORKSPACE} && ${EXTRACT}`);
-        } else {
-          // Node deps live inside the workspace, so park node_modules first.
-          await sandbox.run(`cp -a ${WORKSPACE}/node_modules ${STAGING}/node_modules || true`);
-          await sandbox.run(`rm -rf ${WORKSPACE} && ${EXTRACT}`);
-          await sandbox.run(`mv ${STAGING}/node_modules ${WORKSPACE}/node_modules || true`);
-        }
+        // hash (valid). Rescue workspace deps with mv across the /workspace
+        // reset so thousands of files aren't copied before rm -rf.
+        const depsDir = request.runnerKind === 'pytest' ? '.venv' : 'node_modules';
+        await sandbox.run(`mv ${WORKSPACE}/${depsDir} ${STAGING}/${depsDir} 2>/dev/null || true`);
+        await sandbox.run(`rm -rf ${WORKSPACE} && ${EXTRACT}`);
+        await sandbox.run(`mv ${STAGING}/${depsDir} ${WORKSPACE}/${depsDir} 2>/dev/null || true`);
       } else {
         await sandbox.run(EXTRACT);
 
@@ -144,6 +147,23 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
           if (isFailedStep(install)) {
             // No tests may run against an unprovisioned environment.
             return failedPrepPair('dependency installation', install);
+          }
+        }
+      }
+
+      // Only a cold run produced a complete, reusable environment from scratch.
+      // A HIT boots from an existing snapshot and would just re-snapshot the
+      // same deps, so it is skipped. Snapshotting before cloning, patching, and
+      // running tests keeps untrusted PR code and /run-a /run-b out of it.
+      if (cached === null && deps.snapshotCache) {
+        const ref = await sandbox.createSnapshot(`diffprove-${request.lockfileKey}`);
+        if (ref !== null) {
+          try {
+            await deps.snapshotCache.set(request.repoFullName, request.lockfileKey, ref);
+          } catch (error) {
+            deps.logger.warn(
+              `failed to record environment snapshot for ${request.repoFullName} (${request.lockfileKey}): ${describeError(error)}`,
+            );
           }
         }
       }
@@ -182,31 +202,17 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
         return lockdownFailurePair(error);
       }
 
+      const testCommand = testCommandForRun(request);
+
       const runA = isFailedStep(testOnlyApply)
         ? failedPrepResult('test-only patch application', testOnlyApply)
-        : await sandbox.run(request.testCommand, { cwd: RUN_A, timeoutMs: testTimeoutMs });
+        : await sandbox.run(testCommand, { cwd: RUN_A, timeoutMs: testTimeoutMs });
 
       const runB = isFailedStep(fullApply)
         ? failedPrepResult('full patch application', fullApply)
         : headInstall !== null && isFailedStep(headInstall)
           ? failedPrepResult('head dependency installation', headInstall)
-          : await sandbox.run(request.testCommand, { cwd: RUN_B, timeoutMs: testTimeoutMs });
-
-      // Only a cold run produced a complete, reusable environment from scratch.
-      // A HIT boots from an existing snapshot and would just re-snapshot the
-      // same deps, so it is skipped.
-      if (cached === null && deps.snapshotCache) {
-        const ref = await sandbox.createSnapshot(`diffprove-${request.lockfileKey}`);
-        if (ref !== null) {
-          try {
-            await deps.snapshotCache.set(request.repoFullName, request.lockfileKey, ref);
-          } catch (error) {
-            deps.logger.warn(
-              `failed to record environment snapshot for ${request.repoFullName} (${request.lockfileKey}): ${describeError(error)}`,
-            );
-          }
-        }
-      }
+          : await sandbox.run(testCommand, { cwd: RUN_B, timeoutMs: testTimeoutMs });
 
       return { runA, runB };
     } finally {

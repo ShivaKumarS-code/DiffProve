@@ -291,6 +291,58 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
     expect(limited.catchRate).toBe(0.5);
   });
 
+  it('upserts verification runs idempotently for the same repository, PR, and SHAs', async () => {
+    const repository = await createRepository('node');
+
+    await runs.insertRun(
+      makeRun(repository.repoFullName, {
+        prNumber: 77,
+        baseSha: 'base-1',
+        headSha: 'head-1',
+        changedTestFiles: ['tests/a.test.ts'],
+        runAStatus: 'fail',
+        runBStatus: 'pass',
+        verdict: 'verified-fix',
+        durationMs: 1_000,
+        runALog: 'first A',
+        runBLog: 'first B',
+      }),
+    );
+
+    await runs.insertRun(
+      makeRun(repository.repoFullName, {
+        prNumber: 77,
+        baseSha: 'base-1',
+        headSha: 'head-1',
+        changedTestFiles: ['tests/a.test.ts', 'tests/b.test.ts'],
+        runAStatus: 'pass',
+        runBStatus: 'fail',
+        verdict: 'weak-test',
+        durationMs: 2_500,
+        runALog: 'retry A',
+        runBLog: 'retry B',
+      }),
+    );
+
+    const history = await runs.listRuns(repository.id);
+    expect(history.totalRuns).toBe(1);
+    expect(history.weakTestCount).toBe(1);
+    expect(history.runs).toHaveLength(1);
+    expect(history.runs[0]).toMatchObject({
+      repositoryId: repository.id,
+      prNumber: 77,
+      baseSha: 'base-1',
+      headSha: 'head-1',
+      changedTestFiles: ['tests/a.test.ts', 'tests/b.test.ts'],
+      runAStatus: 'pass',
+      runBStatus: 'fail',
+      verdict: 'weak-test',
+      durationMs: 2_500,
+      runALog: 'retry A',
+      runBLog: 'retry B',
+    });
+  });
+
   it('returns a null catch rate for a repository with no runs', async () => {
     const repository = await createRepository('python');
 

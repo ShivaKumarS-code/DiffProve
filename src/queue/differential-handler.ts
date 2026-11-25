@@ -46,7 +46,12 @@ import type {
   SplitResult,
 } from '../diff/types.js';
 import { classifyRun } from '../runner/classify.js';
-import { buildInstallCommand, buildTestCommand, findLockfile } from '../runner/commands.js';
+import {
+  buildInstallCommand,
+  buildTestCommand,
+  findLockfile,
+  formatCustomTestCommand,
+} from '../runner/commands.js';
 import { detectRunner } from '../runner/detect.js';
 import { conclusionForVerdict, verdictFrom } from '../runner/matrix.js';
 import { buildVerdictReport } from '../runner/report.js';
@@ -55,6 +60,7 @@ import type {
   DifferentialRunner,
   RepoContentClient,
   RepoTarballClient,
+  RunnerKind,
   VerdictReporter,
 } from '../runner/types.js';
 
@@ -94,11 +100,41 @@ function errorMessage(error: unknown): string {
  * not performed with.
  */
 function buildNoTestChangesSummary(split: SplitResult, testGlobs: readonly string[]): string {
+  if (split.hasTestChanges) {
+    return (
+      `${split.files.length} changed file(s); only deleted or binary test file(s) ` +
+      `(${split.changedTestFiles.join(', ')}) matched the test file globs ` +
+      `(${testGlobs.join(', ')}). Differential verification skipped: ` +
+      `no runnable tests exist to verify.`
+    );
+  }
   return (
     `${split.files.length} changed file(s), none matching the test file globs ` +
     `(${testGlobs.join(', ')}). Differential verification skipped: ` +
     `no new or modified tests to verify.`
   );
+}
+
+/**
+ * Infers a `RunnerKind` when a repository configures a custom `testCommand`
+ * and manifest auto-detection found no supported runner.
+ */
+function inferRunnerForCustomCommand(
+  testCommand: string,
+  _packageJson: string | null,
+  pyprojectToml: string | null,
+): RunnerKind {
+  const normalized = testCommand.toLowerCase();
+  if (normalized.includes('pytest') || normalized.includes('python')) {
+    return 'pytest';
+  }
+  if (normalized.includes('jest')) {
+    return 'jest';
+  }
+  if (normalized.includes('vitest')) {
+    return 'vitest';
+  }
+  return pyprojectToml !== null ? 'pytest' : 'vitest';
 }
 
 /**
@@ -185,9 +221,13 @@ export function createDifferentialHandler(
         `${split.changedTestFiles.join(', ') || '(none)'}`,
     );
 
-    // Pure-refactor short-circuit (Phase 2, retained): nothing to verify, so
-    // complete as `neutral` instead of booting a sandbox.
-    if (!split.hasTestChanges) {
+    const customTestCommand = repoConfig?.testCommand ?? null;
+
+    // Pure-refactor / non-runnable-test short-circuit (Phase 2, retained): when
+    // no test files changed, or when only deleted/binary test files matched
+    // and no custom testCommand is configured, complete as `neutral` instead of
+    // booting a sandbox (which would otherwise run the whole suite).
+    if (!split.hasTestChanges || (split.runnableTestFiles.length === 0 && !repoConfig?.testCommand)) {
       const report: NoTestChangesReport = {
         repoFullName,
         headSha,
@@ -238,7 +278,12 @@ export function createDifferentialHandler(
     });
 
     const detected = detectRunner({ packageJson, pyprojectToml });
-    if (detected === null) {
+    let runnerKind: RunnerKind;
+    if (detected !== null) {
+      runnerKind = detected.kind;
+    } else if (customTestCommand !== null) {
+      runnerKind = inferRunnerForCustomCommand(customTestCommand, packageJson, pyprojectToml);
+    } else {
       logger.error(
         `no supported test runner detected for ${repoFullName}#${prNumber} at ${baseSha} ` +
           `(looked for vitest/jest in package.json and pytest in pyproject.toml)`,
@@ -262,12 +307,14 @@ export function createDifferentialHandler(
 
     // The install command describes the BASE state; the test command is the
     // same targeted invocation for Run A and Run B (pipeline steps 4-5).
-    const installCommand = buildInstallCommand(baseFiles, detected.kind);
+    const installCommand = buildInstallCommand(baseFiles, runnerKind);
     // Architecture "API & Interface Contracts": PATCH /api/repos/:id/config
     // overrides the auto-detected `test_command`, so a repo-configured command
     // wins over the one built from the runner kind and changed test files.
     const testCommand =
-      repoConfig?.testCommand ?? buildTestCommand(detected.kind, split.runnableTestFiles);
+      customTestCommand !== null
+        ? formatCustomTestCommand(customTestCommand, split.runnableTestFiles)
+        : buildTestCommand(runnerKind, split.runnableTestFiles);
 
     // Snapshot key from the base lockfile, and a second key for head: Run B
     // must reinstall only when the PR changes dependencies (guardrail #4).
@@ -296,7 +343,7 @@ export function createDifferentialHandler(
     const headLockKey = headLockContent === null ? 'none' : sha256Hex(headLockContent);
 
     const headInstallCommand =
-      headLockKey === lockfileKey ? null : buildInstallCommand(headFiles, detected.kind);
+      headLockKey === lockfileKey ? null : buildInstallCommand(headFiles, runnerKind);
 
     // Fetched on the trusted side and passed as bytes: the token never enters
     // the sandbox (guardrail #2).
@@ -314,7 +361,7 @@ export function createDifferentialHandler(
         testCommand,
         installCommand,
         headInstallCommand,
-        runnerKind: detected.kind,
+        runnerKind,
         lockfileKey,
       });
     } catch (error) {
@@ -328,8 +375,8 @@ export function createDifferentialHandler(
 
     // Classification and verdict mapping are pure policy (src/runner/), so the
     // sandbox is never trusted to decide what a result means.
-    const outcomeA = classifyRun(raw.runA, detected.kind);
-    const outcomeB = classifyRun(raw.runB, detected.kind);
+    const outcomeA = classifyRun(raw.runA, runnerKind);
+    const outcomeB = classifyRun(raw.runB, runnerKind);
 
     const verdict = verdictFrom(outcomeA, outcomeB);
     const conclusion = conclusionForVerdict(verdict);
@@ -379,7 +426,7 @@ export function createDifferentialHandler(
         await runs.insertRun({
           repoFullName,
           installationId,
-          language: detected.kind === 'pytest' ? 'python' : 'node',
+          language: runnerKind === 'pytest' ? 'python' : 'node',
           prNumber,
           baseSha,
           headSha,

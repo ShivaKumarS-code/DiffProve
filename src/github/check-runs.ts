@@ -52,6 +52,8 @@ export async function findDiffProveCheckRun(
     owner: input.owner,
     repo: input.repo,
     ref: input.ref,
+    check_name: CHECK_RUN_NAME,
+    per_page: 100,
     headers: input.headers,
   });
 

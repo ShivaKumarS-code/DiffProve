@@ -13,6 +13,8 @@ import type {
 const EXTRACT =
   'mkdir -p /workspace && tar -xzf /tmp/diffprove/base.tar.gz -C /workspace --strip-components=1';
 
+const PYTEST_TEST_COMMAND = 'export PATH="$PWD/.venv/bin:$PATH"; pytest "tests/test_a.py"';
+
 const TARBALL = Uint8Array.from([31, 139, 8, 0, 1, 2, 3]);
 
 const ok = (): SandboxRawResult => ({
@@ -165,14 +167,14 @@ describe('createE2bDifferentialRunner', () => {
       'write /tmp/diffprove/full.patch',
       `run ${EXTRACT} (cwd=-, timeout=-)`,
       'run pip install -e . -r requirements.txt (cwd=/workspace, timeout=240000)',
+      'snapshot diffprove-lock-abc123',
       'run cp -a /workspace /run-a (cwd=-, timeout=-)',
       'run cp -a /workspace /run-b (cwd=-, timeout=-)',
       'run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=/run-a, timeout=30000)',
       'run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=/run-b, timeout=30000)',
       'network denyAll=true',
-      'run pytest "tests/test_a.py" (cwd=/run-a, timeout=120000)',
-      'run pytest "tests/test_a.py" (cwd=/run-b, timeout=120000)',
-      'snapshot diffprove-lock-abc123',
+      `run ${PYTEST_TEST_COMMAND} (cwd=/run-a, timeout=120000)`,
+      `run ${PYTEST_TEST_COMMAND} (cwd=/run-b, timeout=120000)`,
       'close',
     ]);
 
@@ -223,9 +225,9 @@ describe('createE2bDifferentialRunner', () => {
       'write /tmp/diffprove/base.tar.gz',
       'write /tmp/diffprove/test-only.patch',
       'write /tmp/diffprove/full.patch',
-      'run cp -a /workspace/node_modules /tmp/diffprove/node_modules || true (cwd=-, timeout=-)',
+      'run mv /workspace/node_modules /tmp/diffprove/node_modules 2>/dev/null || true (cwd=-, timeout=-)',
       `run rm -rf /workspace && ${EXTRACT} (cwd=-, timeout=-)`,
-      'run mv /tmp/diffprove/node_modules /workspace/node_modules || true (cwd=-, timeout=-)',
+      'run mv /tmp/diffprove/node_modules /workspace/node_modules 2>/dev/null || true (cwd=-, timeout=-)',
       'run cp -a /workspace /run-a (cwd=-, timeout=-)',
       'run cp -a /workspace /run-b (cwd=-, timeout=-)',
       'run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=/run-a, timeout=30000)',
@@ -242,7 +244,7 @@ describe('createE2bDifferentialRunner', () => {
     expect(set).not.toHaveBeenCalled();
   });
 
-  it('resets only the tree for a pytest snapshot HIT (deps live in site-packages)', async () => {
+  it('boots from the cached snapshot and rescues .venv for pytest projects', async () => {
     const { factory, calls, createCalls } = createFakeFactory();
     const { cache, set } = createFakeCache({ value: 'snap-tpl' });
     const { logger } = createLogger();
@@ -260,14 +262,16 @@ describe('createE2bDifferentialRunner', () => {
       'write /tmp/diffprove/base.tar.gz',
       'write /tmp/diffprove/test-only.patch',
       'write /tmp/diffprove/full.patch',
+      'run mv /workspace/.venv /tmp/diffprove/.venv 2>/dev/null || true (cwd=-, timeout=-)',
       `run rm -rf /workspace && ${EXTRACT} (cwd=-, timeout=-)`,
+      'run mv /tmp/diffprove/.venv /workspace/.venv 2>/dev/null || true (cwd=-, timeout=-)',
       'run cp -a /workspace /run-a (cwd=-, timeout=-)',
       'run cp -a /workspace /run-b (cwd=-, timeout=-)',
       'run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=/run-a, timeout=30000)',
       'run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=/run-b, timeout=30000)',
       'network denyAll=true',
-      'run pytest "tests/test_a.py" (cwd=/run-a, timeout=120000)',
-      'run pytest "tests/test_a.py" (cwd=/run-b, timeout=120000)',
+      `run ${PYTEST_TEST_COMMAND} (cwd=/run-a, timeout=120000)`,
+      `run ${PYTEST_TEST_COMMAND} (cwd=/run-b, timeout=120000)`,
       'close',
     ]);
     expect(
@@ -276,6 +280,7 @@ describe('createE2bDifferentialRunner', () => {
     expect(runCalls(calls).map((call) => call.command)).not.toContain(
       'pip install -e . -r requirements.txt',
     );
+    expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
     expect(set).not.toHaveBeenCalled();
   });
 
@@ -315,7 +320,7 @@ describe('createE2bDifferentialRunner', () => {
     const commands = runCalls(calls).map((call) => call.command);
     expect(commands).not.toContain('cp -a /workspace /run-a');
     expect(commands).not.toContain('cp -a /workspace /run-b');
-    expect(commands).not.toContain(request.testCommand);
+    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
     expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
     expect(set).not.toHaveBeenCalled();
     expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
@@ -351,7 +356,7 @@ describe('createE2bDifferentialRunner', () => {
       durationMs: 12,
     });
     expect(result.runB).toEqual(ok());
-    const tests = runCalls(calls).filter((call) => call.command === request.testCommand);
+    const tests = runCalls(calls).filter((call) => call.command === PYTEST_TEST_COMMAND);
     expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-b']);
   });
 
@@ -385,7 +390,7 @@ describe('createE2bDifferentialRunner', () => {
       durationMs: 9,
     });
     expect(result.runA).toEqual(ok());
-    const tests = runCalls(calls).filter((call) => call.command === request.testCommand);
+    const tests = runCalls(calls).filter((call) => call.command === PYTEST_TEST_COMMAND);
     expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-a']);
   });
 
@@ -488,7 +493,7 @@ describe('createE2bDifferentialRunner', () => {
     };
     expect(result.runA).toEqual(expected);
     expect(result.runB).toEqual(expected);
-    expect(runCalls(calls).map((call) => call.command)).not.toContain(request.testCommand);
+    expect(runCalls(calls).some((call) => call.command.includes(request.testCommand))).toBe(false);
     expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
   });
 
@@ -539,7 +544,7 @@ describe('createE2bDifferentialRunner', () => {
       durationMs: 120_000,
     };
     const { factory } = createFakeFactory({
-      onRun: (command) => (command === 'pytest "tests/test_a.py"' ? timedOutRaw : ok()),
+      onRun: (command) => (command === PYTEST_TEST_COMMAND ? timedOutRaw : ok()),
     });
     const { cache } = createFakeCache();
     const { logger } = createLogger();
@@ -586,5 +591,28 @@ describe('createE2bDifferentialRunner', () => {
     expect(warn.mock.calls.map(([message]) => message)).toContain(
       'failed to close E2B sandbox: kill failed',
     );
+  });
+
+  it('runs jest testCommand directly without .venv PATH wrapping', async () => {
+    const { factory, calls } = createFakeFactory();
+    const { cache } = createFakeCache();
+    const { logger } = createLogger();
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    await runner(
+      createRequest({
+        runnerKind: 'jest',
+        installCommand: 'npm ci',
+        testCommand: 'npx jest tests/a.test.js',
+      }),
+    );
+
+    const tests = runCalls(calls).filter((call) => call.command === 'npx jest tests/a.test.js');
+    expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-a', '/run-b']);
+    expect(runCalls(calls).some((call) => call.command.includes('.venv'))).toBe(false);
   });
 });

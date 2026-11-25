@@ -73,4 +73,22 @@ export const MIGRATIONS: readonly { name: string; sql: string }[] = [
         on env_snapshots (repository_id, lockfile_hash);
     `,
   },
+  {
+    name: '002-dedupe-verification-runs',
+    sql: `
+      delete from verification_runs a
+      using verification_runs b
+      where a.repository_id = b.repository_id
+        and a.pr_number = b.pr_number
+        and a.base_sha = b.base_sha
+        and a.head_sha = b.head_sha
+        and (
+          a.created_at < b.created_at
+          or (a.created_at = b.created_at and a.ctid < b.ctid)
+        );
+
+      create unique index if not exists verification_runs_repo_pr_base_head_uidx
+        on verification_runs (repository_id, pr_number, base_sha, head_sha);
+    `,
+  },
 ];
