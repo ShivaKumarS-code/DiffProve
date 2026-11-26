@@ -13,9 +13,17 @@ import { createHmac } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { AuthDeps } from './api/auth-routes.js';
 import type { ApiDeps } from './api/routes.js';
 import { buildApp } from './app.js';
+import {
+  encryptSession,
+  OAUTH_STATE_COOKIE_NAME,
+  SESSION_COOKIE_NAME,
+  type SessionUser,
+} from './auth/session.js';
 import type { RepositoryRow, RunHistorySummary, VerificationRunRow } from './db/types.js';
+import type { AccessibleRepo, GitHubOAuthClient } from './github/user-auth.js';
 
 const WEBHOOK_SECRET = 'test-secret';
 
@@ -584,5 +592,390 @@ describe('dashboard API', () => {
         });
       }
     });
+  });
+});
+
+describe('GitHub OAuth and per-repo authorization', () => {
+  const SESSION_SECRET = 'test-session-secret-at-least-16-chars';
+  const PUBLIC_URL = 'https://diffprove.example.com';
+
+  const testUser: SessionUser = {
+    id: 101,
+    login: 'octocat',
+    avatarUrl: 'https://avatars.githubusercontent.com/u/101',
+  };
+
+  const accessibleRepoA: AccessibleRepo = {
+    repoFullName: 'octocat/alpha-repo',
+    installationId: 42,
+    canWrite: false,
+    languageHint: 'python',
+  };
+
+  const accessibleRepoB: AccessibleRepo = {
+    repoFullName: 'octocat/hello-world',
+    installationId: 42,
+    canWrite: true,
+    languageHint: 'node',
+  };
+
+  const alphaRepoRow: RepositoryRow = {
+    ...repositoryRow,
+    id: '44444444-4444-4444-8444-444444444444',
+    repoFullName: 'octocat/alpha-repo',
+    language: 'python',
+  };
+
+  const inaccessibleRepoRow: RepositoryRow = {
+    ...repositoryRow,
+    id: UNKNOWN_REPO_ID,
+    repoFullName: 'stranger/private-repo',
+  };
+
+  const authorizeUrl = vi.fn(
+    ({ state, redirectUri }: { state: string; redirectUri: string }) =>
+      `https://github.com/login/oauth/authorize?client_id=cid&redirect_uri=${encodeURIComponent(
+        redirectUri,
+      )}&state=${encodeURIComponent(state)}`,
+  );
+  const exchangeCode = vi.fn<GitHubOAuthClient['exchangeCode']>();
+  const fetchUser = vi.fn<GitHubOAuthClient['fetchUser']>();
+  const listAccessibleRepos = vi.fn<GitHubOAuthClient['listAccessibleRepos']>();
+
+  const auth: AuthDeps = {
+    sessionSecret: SESSION_SECRET,
+    githubOAuth: {
+      authorizeUrl,
+      exchangeCode,
+      fetchUser,
+      listAccessibleRepos,
+    },
+    publicUrl: PUBLIC_URL,
+  };
+
+  let oauthApp: FastifyInstance;
+
+  function setCookieHeaders(raw: string | string[] | undefined): string[] {
+    if (raw === undefined) {
+      return [];
+    }
+    return Array.isArray(raw) ? raw : [raw];
+  }
+
+  function createSessionCookie(accessToken: string = 'ghu_test_token'): string {
+    const token = encryptSession(
+      {
+        user: testUser,
+        accessToken,
+        exp: Date.now() + 60_000,
+      },
+      SESSION_SECRET,
+    );
+    return `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`;
+  }
+
+  beforeAll(() => {
+    oauthApp = buildApp({
+      webhookSecret: WEBHOOK_SECRET,
+      enqueuer: { enqueue },
+      checkPoster: { postQueuedCheckRun },
+      api,
+      auth,
+      logLevel: 'silent',
+    });
+  });
+
+  afterAll(async () => {
+    await oauthApp.close();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    exchangeCode.mockResolvedValue('ghu_fresh_token');
+    fetchUser.mockResolvedValue(testUser);
+    listAccessibleRepos.mockResolvedValue([accessibleRepoB, accessibleRepoA]);
+    ensureRepository.mockImplementation(async ({ repoFullName }) =>
+      repoFullName === alphaRepoRow.repoFullName ? alphaRepoRow : repositoryRow,
+    );
+    getRepository.mockResolvedValue(repositoryRow);
+    updateRepositoryConfig.mockResolvedValue(repositoryRow);
+    listRuns.mockResolvedValue(runSummary);
+  });
+
+  it('reports oauthEnabled: false on GET /api/auth/session when OAuth is disabled', async () => {
+    const response = await apiApp.inject({ method: 'GET', url: '/api/auth/session' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ oauthEnabled: false, user: null });
+  });
+
+  it('returns 503 on /api/auth/login and /api/auth/callback when OAuth is disabled', async () => {
+    const loginRes = await apiApp.inject({ method: 'GET', url: '/api/auth/login' });
+    const callbackRes = await apiApp.inject({
+      method: 'GET',
+      url: '/api/auth/callback?code=abc&state=xyz',
+    });
+
+    expect(loginRes.statusCode).toBe(503);
+    expect(loginRes.json()).toEqual({ message: 'GitHub OAuth is not configured' });
+    expect(callbackRes.statusCode).toBe(503);
+    expect(callbackRes.json()).toEqual({ message: 'GitHub OAuth is not configured' });
+  });
+
+  it('reports oauthEnabled: true and user null vs authenticated user on GET /api/auth/session', async () => {
+    const anonRes = await oauthApp.inject({ method: 'GET', url: '/api/auth/session' });
+    expect(anonRes.statusCode).toBe(200);
+    expect(anonRes.json()).toEqual({ oauthEnabled: true, user: null });
+
+    const authedRes = await oauthApp.inject({
+      method: 'GET',
+      url: '/api/auth/session',
+      headers: { cookie: createSessionCookie() },
+    });
+    expect(authedRes.statusCode).toBe(200);
+    expect(authedRes.json()).toEqual({ oauthEnabled: true, user: testUser });
+  });
+
+  it('GET /api/auth/login sets signed state cookie and redirects 302 to GitHub with PUBLIC_URL callback', async () => {
+    const response = await oauthApp.inject({ method: 'GET', url: '/api/auth/login' });
+
+    expect(response.statusCode).toBe(302);
+    const location = response.headers.location;
+    expect(location).toBeDefined();
+
+    const redirectTarget = new URL(location as string);
+    expect(redirectTarget.origin).toBe('https://github.com');
+    expect(redirectTarget.pathname).toBe('/login/oauth/authorize');
+    expect(redirectTarget.searchParams.get('redirect_uri')).toBe(
+      `${PUBLIC_URL}/api/auth/callback`,
+    );
+    const state = redirectTarget.searchParams.get('state');
+    expect(state).toBeTruthy();
+
+    const cookies = setCookieHeaders(response.headers['set-cookie']);
+    const stateCookie = cookies.find((c) => c.startsWith(`${OAUTH_STATE_COOKIE_NAME}=`));
+    expect(stateCookie).toBeDefined();
+    expect(stateCookie).toContain('HttpOnly');
+    expect(stateCookie).toContain('Secure');
+    expect(stateCookie).toContain('SameSite=Lax');
+  });
+
+  it('GET /api/auth/callback rejects mismatched CSRF state and clears state cookie', async () => {
+    const loginRes = await oauthApp.inject({ method: 'GET', url: '/api/auth/login' });
+    const rawCookie = setCookieHeaders(loginRes.headers['set-cookie'])[0] as string;
+    const cookiePair = rawCookie.split(';')[0] as string;
+
+    const response = await oauthApp.inject({
+      method: 'GET',
+      url: '/api/auth/callback?code=oauth-code&state=wrong-state',
+      headers: { cookie: cookiePair },
+    });
+
+    expect(response.statusCode).toBe(302);
+    expect(response.headers.location).toBe('/?authError=invalid_oauth_state');
+    expect(exchangeCode).not.toHaveBeenCalled();
+
+    const clearedCookie = setCookieHeaders(response.headers['set-cookie']).find((c) =>
+      c.startsWith(`${OAUTH_STATE_COOKIE_NAME}=`),
+    );
+    expect(clearedCookie).toContain('Max-Age=0');
+  });
+
+  it('GET /api/auth/callback exchanges code, fetches user, sets HttpOnly session cookie, and redirects to /', async () => {
+    const loginRes = await oauthApp.inject({ method: 'GET', url: '/api/auth/login' });
+    const redirectUrl = new URL(loginRes.headers.location as string);
+    const state = redirectUrl.searchParams.get('state') as string;
+    const rawStateCookie = setCookieHeaders(loginRes.headers['set-cookie'])[0] as string;
+    const stateCookiePair = rawStateCookie.split(';')[0] as string;
+
+    const callbackRes = await oauthApp.inject({
+      method: 'GET',
+      url: `/api/auth/callback?code=valid-code&state=${encodeURIComponent(state)}`,
+      headers: { cookie: stateCookiePair },
+    });
+
+    expect(callbackRes.statusCode).toBe(302);
+    expect(callbackRes.headers.location).toBe('/');
+    expect(exchangeCode).toHaveBeenCalledWith(
+      'valid-code',
+      `${PUBLIC_URL}/api/auth/callback`,
+    );
+    expect(fetchUser).toHaveBeenCalledWith('ghu_fresh_token');
+
+    const cookies = setCookieHeaders(callbackRes.headers['set-cookie']);
+    const clearedState = cookies.find((c) => c.startsWith(`${OAUTH_STATE_COOKIE_NAME}=`));
+    const sessionCookie = cookies.find((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`));
+    expect(clearedState).toContain('Max-Age=0');
+    expect(sessionCookie).toBeDefined();
+    expect(sessionCookie).toContain('HttpOnly');
+    expect(sessionCookie).toContain('Secure');
+    expect(sessionCookie).toContain('SameSite=Lax');
+
+    const sessionCookiePair = (sessionCookie as string).split(';')[0] as string;
+    const sessionRes = await oauthApp.inject({
+      method: 'GET',
+      url: '/api/auth/session',
+      headers: { cookie: sessionCookiePair },
+    });
+    expect(sessionRes.statusCode).toBe(200);
+    expect(sessionRes.json()).toEqual({ oauthEnabled: true, user: testUser });
+  });
+
+  it('GET /api/auth/callback redirects with oauth_exchange_failed when token exchange throws', async () => {
+    const loginRes = await oauthApp.inject({ method: 'GET', url: '/api/auth/login' });
+    const state = new URL(loginRes.headers.location as string).searchParams.get(
+      'state',
+    ) as string;
+    const stateCookiePair = (setCookieHeaders(loginRes.headers['set-cookie'])[0] as string).split(
+      ';',
+    )[0] as string;
+    exchangeCode.mockRejectedValueOnce(new Error('GitHub OAuth token exchange failed: HTTP 400'));
+
+    const response = await oauthApp.inject({
+      method: 'GET',
+      url: `/api/auth/callback?code=bad-code&state=${encodeURIComponent(state)}`,
+      headers: { cookie: stateCookiePair },
+    });
+
+    expect(response.statusCode).toBe(302);
+    expect(response.headers.location).toBe('/?authError=oauth_exchange_failed');
+  });
+
+  it('POST /api/auth/logout clears the session cookie', async () => {
+    const response = await oauthApp.inject({
+      method: 'POST',
+      url: '/api/auth/logout',
+      headers: { cookie: createSessionCookie() },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ ok: true });
+
+    const cookies = setCookieHeaders(response.headers['set-cookie']);
+    const clearedSession = cookies.find((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`));
+    expect(clearedSession).toBeDefined();
+    expect(clearedSession).toContain(`${SESSION_COOKIE_NAME}=;`);
+    expect(clearedSession).toContain('Max-Age=0');
+    expect(clearedSession).toContain('HttpOnly');
+    expect(clearedSession).toContain('SameSite=Lax');
+  });
+
+  it('returns 401 on /api/repos, /api/repos/:id/runs, and PATCH /api/repos/:id/config when unauthenticated', async () => {
+    const responses = [
+      await oauthApp.inject({ method: 'GET', url: '/api/repos' }),
+      await oauthApp.inject({ method: 'GET', url: `/api/repos/${REPO_ID}/runs` }),
+      await oauthApp.inject({
+        method: 'PATCH',
+        url: `/api/repos/${REPO_ID}/config`,
+        payload: { enabled: false },
+      }),
+    ];
+
+    for (const response of responses) {
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({ message: 'authentication required' });
+    }
+    expect(listRepositories).not.toHaveBeenCalled();
+    expect(ensureRepository).not.toHaveBeenCalled();
+    expect(getRepository).not.toHaveBeenCalled();
+    expect(updateRepositoryConfig).not.toHaveBeenCalled();
+  });
+
+  it('GET /api/repos eagerly ensures accessible repos and excludes inaccessible ones', async () => {
+    listRepositories.mockResolvedValueOnce([inaccessibleRepoRow, repositoryRow, alphaRepoRow]);
+
+    const response = await oauthApp.inject({
+      method: 'GET',
+      url: '/api/repos',
+      headers: { cookie: createSessionCookie('ghu_user_token') },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(listAccessibleRepos).toHaveBeenCalledWith('ghu_user_token');
+    expect(listRepositories).not.toHaveBeenCalled();
+    expect(ensureRepository).toHaveBeenCalledTimes(2);
+    expect(ensureRepository).toHaveBeenCalledWith({
+      repoFullName: 'octocat/hello-world',
+      installationId: 42,
+      language: 'node',
+    });
+    expect(ensureRepository).toHaveBeenCalledWith({
+      repoFullName: 'octocat/alpha-repo',
+      installationId: 42,
+      language: 'python',
+    });
+
+    const body = response.json() as { repos: Array<{ repoFullName: string }> };
+    expect(body.repos.map((r) => r.repoFullName)).toEqual([
+      'octocat/alpha-repo',
+      'octocat/hello-world',
+    ]);
+  });
+
+  it('GET /api/repos/:id/runs returns 403 for an inaccessible repository and 200 when accessible', async () => {
+    getRepository.mockResolvedValueOnce(inaccessibleRepoRow);
+
+    const forbiddenRes = await oauthApp.inject({
+      method: 'GET',
+      url: `/api/repos/${UNKNOWN_REPO_ID}/runs`,
+      headers: { cookie: createSessionCookie() },
+    });
+    expect(forbiddenRes.statusCode).toBe(403);
+    expect(forbiddenRes.json()).toEqual({
+      message: 'you do not have access to this repository',
+    });
+    expect(listRuns).not.toHaveBeenCalled();
+
+    getRepository.mockResolvedValueOnce(repositoryRow);
+    const okRes = await oauthApp.inject({
+      method: 'GET',
+      url: `/api/repos/${REPO_ID}/runs`,
+      headers: { cookie: createSessionCookie() },
+    });
+    expect(okRes.statusCode).toBe(200);
+    expect(listRuns).toHaveBeenCalledWith(REPO_ID, 50);
+  });
+
+  it('PATCH /api/repos/:id/config returns 403 when canWrite is false or inaccessible, and 200 when canWrite is true', async () => {
+    getRepository.mockResolvedValueOnce(inaccessibleRepoRow);
+    const noAccessRes = await oauthApp.inject({
+      method: 'PATCH',
+      url: `/api/repos/${UNKNOWN_REPO_ID}/config`,
+      headers: { cookie: createSessionCookie() },
+      payload: { enabled: false },
+    });
+    expect(noAccessRes.statusCode).toBe(403);
+    expect(noAccessRes.json()).toEqual({
+      message: 'you do not have access to this repository',
+    });
+    expect(updateRepositoryConfig).not.toHaveBeenCalled();
+
+    getRepository.mockResolvedValueOnce(alphaRepoRow);
+    const readOnlyRes = await oauthApp.inject({
+      method: 'PATCH',
+      url: `/api/repos/${alphaRepoRow.id}/config`,
+      headers: { cookie: createSessionCookie() },
+      payload: { enabled: false },
+    });
+    expect(readOnlyRes.statusCode).toBe(403);
+    expect(readOnlyRes.json()).toEqual({
+      message: 'write or admin permission required to update configuration',
+    });
+    expect(updateRepositoryConfig).not.toHaveBeenCalled();
+
+    getRepository.mockResolvedValueOnce(repositoryRow);
+    const updatedRow: RepositoryRow = { ...repositoryRow, enabled: false };
+    updateRepositoryConfig.mockResolvedValueOnce(updatedRow);
+    const writeRes = await oauthApp.inject({
+      method: 'PATCH',
+      url: `/api/repos/${REPO_ID}/config`,
+      headers: { cookie: createSessionCookie() },
+      payload: { enabled: false },
+    });
+    expect(writeRes.statusCode).toBe(200);
+    expect(writeRes.json()).toEqual({
+      repository: { ...updatedRow, createdAt: updatedRow.createdAt.toISOString() },
+    });
+    expect(updateRepositoryConfig).toHaveBeenCalledWith(REPO_ID, { enabled: false });
   });
 });

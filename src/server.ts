@@ -17,6 +17,7 @@
 
 import 'dotenv/config';
 
+import { type AuthDeps } from './api/auth-routes.js';
 import { buildApp } from './app.js';
 import { ConfigError, loadConfig, type AppConfig } from './config.js';
 import { createInstallationStore } from './db/installations.js';
@@ -31,6 +32,7 @@ import { createAppAuthenticator, createOctokit } from './github/octokit.js';
 import { createPrDiffClient } from './github/pulls.js';
 import { createRepoContentClient } from './github/repo-content.js';
 import { createRepoTarballClient } from './github/repo-tarball.js';
+import { createGitHubOAuthClient } from './github/user-auth.js';
 import { createVerdictReporter } from './github/verdict-report.js';
 import { createDifferentialHandler } from './queue/differential-handler.js';
 import { createEnqueuer } from './queue/enqueuer.js';
@@ -92,6 +94,20 @@ async function main(): Promise<void> {
   const authenticator = createAppAuthenticator(config.githubAppId, config.githubPrivateKey);
   const checkPoster = createCheckRunPoster(octokit, authenticator);
 
+  const auth: AuthDeps | null =
+    config.githubClientId !== null &&
+    config.githubClientSecret !== null &&
+    config.sessionSecret !== null
+      ? {
+          sessionSecret: config.sessionSecret,
+          githubOAuth: createGitHubOAuthClient({
+            clientId: config.githubClientId,
+            clientSecret: config.githubClientSecret,
+          }),
+          publicUrl: config.publicUrl,
+        }
+      : null;
+
   const app = buildApp({
     webhookSecret: config.webhookSecret,
     enqueuer,
@@ -99,6 +115,7 @@ async function main(): Promise<void> {
     logLevel: config.logLevel,
     api: repositories !== null && runsStore !== null ? { repositories, runs: runsStore } : null,
     installations: installationStore,
+    auth,
   });
 
   // Phase 3 differential runner. Without an E2B_API_KEY there is no sandbox, so

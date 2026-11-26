@@ -32,6 +32,10 @@ function fullEnv(): Record<string, string | undefined> {
     GITHUB_APP_ID: '987654',
     GITHUB_PRIVATE_KEY: FAKE_PEM,
     GITHUB_WEBHOOK_SECRET: 'placeholder-webhook-secret',
+    GITHUB_CLIENT_ID: 'Iv1.placeholderclientid',
+    GITHUB_CLIENT_SECRET: 'placeholder-oauth-client-secret',
+    SESSION_SECRET: 'placeholder-session-secret-1234',
+    PUBLIC_URL: 'https://diffprove.example.com',
     LOG_LEVEL: 'debug',
     E2B_API_KEY: 'e2b_placeholder_api_key',
     E2B_TEMPLATE_ID: 'diffprove-placeholder-template',
@@ -64,6 +68,10 @@ describe('loadConfig with valid input', () => {
       githubAppId: '987654',
       githubPrivateKey: FAKE_PEM,
       webhookSecret: 'placeholder-webhook-secret',
+      githubClientId: 'Iv1.placeholderclientid',
+      githubClientSecret: 'placeholder-oauth-client-secret',
+      sessionSecret: 'placeholder-session-secret-1234',
+      publicUrl: 'https://diffprove.example.com',
       logLevel: 'debug',
       e2bApiKey: 'e2b_placeholder_api_key',
       e2bTemplateId: 'diffprove-placeholder-template',
@@ -72,12 +80,16 @@ describe('loadConfig with valid input', () => {
     });
   });
 
-  it('applies defaults for PORT, REDIS_URL, DATABASE_URL and LOG_LEVEL when omitted', () => {
+  it('applies defaults for PORT, REDIS_URL, DATABASE_URL, OAuth, PUBLIC_URL and LOG_LEVEL when omitted', () => {
     const config = loadConfig(requiredEnv());
 
     expect(config.port).toBe(3000);
     expect(config.redisUrl).toBe('redis://127.0.0.1:6379');
     expect(config.databaseUrl).toBeNull();
+    expect(config.githubClientId).toBeNull();
+    expect(config.githubClientSecret).toBeNull();
+    expect(config.sessionSecret).toBeNull();
+    expect(config.publicUrl).toBeNull();
     expect(config.logLevel).toBe('info');
   });
 
@@ -435,4 +447,101 @@ describe('loadConfig — DATABASE_URL', () => {
     expect(error.message).toContain('PORT');
     expect(error.message).toContain('DATABASE_URL');
   });
+});
+
+describe('loadConfig — GitHub OAuth & PUBLIC_URL', () => {
+  it('resolves all OAuth fields and publicUrl to null when omitted or blank', () => {
+    const omitted = loadConfig(requiredEnv());
+    expect(omitted.githubClientId).toBeNull();
+    expect(omitted.githubClientSecret).toBeNull();
+    expect(omitted.sessionSecret).toBeNull();
+    expect(omitted.publicUrl).toBeNull();
+
+    const blank = loadConfig({
+      ...requiredEnv(),
+      GITHUB_CLIENT_ID: '   ',
+      GITHUB_CLIENT_SECRET: '',
+      SESSION_SECRET: '\t',
+      PUBLIC_URL: '  ',
+    });
+    expect(blank.githubClientId).toBeNull();
+    expect(blank.githubClientSecret).toBeNull();
+    expect(blank.sessionSecret).toBeNull();
+    expect(blank.publicUrl).toBeNull();
+  });
+
+  it('populates all OAuth fields when all three are valid and trims whitespace', () => {
+    const config = loadConfig({
+      ...requiredEnv(),
+      GITHUB_CLIENT_ID: '  Iv1.client123  ',
+      GITHUB_CLIENT_SECRET: '  super-secret-oauth-client  ',
+      SESSION_SECRET: '  exactly-16-chars  ',
+    });
+
+    expect(config.githubClientId).toBe('Iv1.client123');
+    expect(config.githubClientSecret).toBe('super-secret-oauth-client');
+    expect(config.sessionSecret).toBe('exactly-16-chars');
+  });
+
+  it('rejects partial OAuth configuration, lists missing vars, and never echoes secrets', () => {
+    const onlyClientId = captureConfigError({
+      ...requiredEnv(),
+      GITHUB_CLIENT_ID: 'Iv1.client123',
+    });
+    expect(onlyClientId.message).toContain('GITHUB_CLIENT_SECRET');
+    expect(onlyClientId.message).toContain('SESSION_SECRET');
+    expect(onlyClientId.message).not.toContain('GITHUB_CLIENT_ID: is required');
+
+    const secretMarker = 'SUPER_SECRET_OAUTH_CLIENT_TOKEN';
+    const sessionMarker = 'SUPER_SECRET_SESSION_SIGNING_KEY';
+    const missingClientId = captureConfigError({
+      ...requiredEnv(),
+      GITHUB_CLIENT_SECRET: secretMarker,
+      SESSION_SECRET: sessionMarker,
+    });
+    expect(missingClientId.message).toContain('GITHUB_CLIENT_ID');
+    expect(missingClientId.message).toContain('required');
+    expect(missingClientId.message).not.toContain(secretMarker);
+    expect(missingClientId.message).not.toContain(sessionMarker);
+  });
+
+  it('rejects SESSION_SECRET shorter than 16 characters without echoing its value', () => {
+    const shortSecret = 'too-short-15chr';
+    expect(shortSecret).toHaveLength(15);
+
+    const error = captureConfigError({
+      ...requiredEnv(),
+      GITHUB_CLIENT_ID: 'Iv1.client123',
+      GITHUB_CLIENT_SECRET: 'placeholder-oauth-client-secret',
+      SESSION_SECRET: shortSecret,
+    });
+
+    expect(error.message).toContain('SESSION_SECRET');
+    expect(error.message).toContain('16');
+    expect(error.message).not.toContain(shortSecret);
+  });
+
+  it('accepts http:// and https:// PUBLIC_URL and strips trailing slashes', () => {
+    expect(
+      loadConfig({ ...requiredEnv(), PUBLIC_URL: 'http://localhost:3000/' }).publicUrl,
+    ).toBe('http://localhost:3000');
+
+    expect(
+      loadConfig({ ...requiredEnv(), PUBLIC_URL: '  https://diffprove.example.com///  ' })
+        .publicUrl,
+    ).toBe('https://diffprove.example.com');
+  });
+
+  it.each(['diffprove.example.com', 'ftp://diffprove.example.com', 'ws://localhost:3000'])(
+    'rejects invalid PUBLIC_URL value %j',
+    (publicUrl) => {
+      const error = captureConfigError({
+        ...requiredEnv(),
+        PUBLIC_URL: publicUrl,
+      });
+
+      expect(error.name).toBe('ConfigError');
+      expect(error.message).toContain('PUBLIC_URL');
+    },
+  );
 });

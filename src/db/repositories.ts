@@ -103,7 +103,7 @@ export function createRepositoryStore(pool: DbPool): RepositoryStore {
   async function ensureRepository(input: {
     repoFullName: string;
     installationId: number | null;
-    language: 'python' | 'node';
+    language: 'python' | 'node' | null;
   }): Promise<RepositoryRow> {
     const installationId = await resolveInstallationUuid(input.installationId);
 
@@ -112,7 +112,7 @@ export function createRepositoryStore(pool: DbPool): RepositoryStore {
        values ($1, $2, $3)
        on conflict (repo_full_name) do update
          set installation_id = coalesce(excluded.installation_id, repositories.installation_id),
-             language = excluded.language
+             language = coalesce(excluded.language, repositories.language)
        returning *`,
       [installationId, input.repoFullName, input.language],
     );

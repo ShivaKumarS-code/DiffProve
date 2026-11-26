@@ -83,12 +83,13 @@ export interface InstallationStore {
 export interface RepositoryStore {
   /**
    * Ensures a repository row exists for `repoFullName` (insert when missing;
-   * when present, update the installation linkage and language). Returns the row.
+   * when present, update the installation linkage and language when non-null).
+   * Returns the row.
    */
   ensureRepository(input: {
     repoFullName: string;
     installationId: number | null;
-    language: 'python' | 'node';
+    language: 'python' | 'node' | null;
   }): Promise<RepositoryRow>;
   getRepository(id: string): Promise<RepositoryRow | null>;
   listRepositories(): Promise<RepositoryRow[]>;
@@ -108,7 +109,7 @@ export interface VerificationRunInsert {
   repoFullName: string;
   installationId: number | null;
   /** Stored on the ensured repository row. */
-  language: 'python' | 'node';
+  language: 'python' | 'node' | null;
   prNumber: number;
   baseSha: string;
   headSha: string;

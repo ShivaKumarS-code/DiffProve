@@ -14,6 +14,7 @@
 
 import Fastify, { type FastifyInstance } from 'fastify';
 
+import { registerAuthRoutes, type AuthDeps } from './api/auth-routes.js';
 import { registerApiRoutes, type ApiDeps } from './api/routes.js';
 import type { InstallationStore } from './db/types.js';
 import type { CheckRunPoster, Enqueuer } from './domain.js';
@@ -50,6 +51,12 @@ export interface AppDeps {
    * acknowledgement-only behavior.
    */
   installations?: InstallationStore | null;
+  /**
+   * GitHub OAuth session + per-repository authorization config. Omitted or
+   * null when OAuth login is disabled (`GET /api/auth/session` reports
+   * `oauthEnabled: false`, and `/api/repos*` keeps unauthenticated dev mode).
+   */
+  auth?: AuthDeps | null;
   /** Pino log level; default 'info'. */
   logLevel?: string;
 }
@@ -151,10 +158,12 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     }
   });
 
-  // Dashboard API (docs/architecture.md, "API & Interface Contracts":
-  // `GET /api/repos/:id/runs` and `PATCH /api/repos/:id/config`). A null dep
-  // means persistence is not configured and each route answers 503.
-  registerApiRoutes(app, deps.api ?? null);
+  // Dashboard OAuth + API (docs/architecture.md, "API & Interface Contracts":
+  // `GET /api/repos`, `GET /api/repos/:id/runs`, `PATCH /api/repos/:id/config`).
+  // A null `api` means persistence is not configured and each route answers 503.
+  const auth = deps.auth ?? null;
+  registerAuthRoutes(app, auth);
+  registerApiRoutes(app, deps.api ?? null, auth);
 
   return app;
 }

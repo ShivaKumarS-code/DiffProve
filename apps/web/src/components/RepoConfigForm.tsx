@@ -14,7 +14,7 @@ import { patchRepoConfig, toApiError, type RepoRow } from '../lib/api';
  */
 
 /**
- * Comma-separated input → glob list. `[]` becomes `null` (clear the override),
+ * Comma-separated input to glob list. `[]` becomes `null` (clear the override),
  * matching the API's `test_file_globs: string[] | null` field.
  */
 function parseGlobs(text: string): string[] | null {
@@ -80,104 +80,105 @@ export default function RepoConfigForm({
   }
 
   return (
-    <section className="rounded-xl border border-neutral-800 bg-neutral-900/60 p-5">
-      <div className="flex flex-wrap items-baseline justify-between gap-2">
-        <h2 className="text-lg font-semibold text-neutral-100">Test configuration</h2>
-        <p className="text-xs text-neutral-500">
-          Overrides the auto-detected test command and file globs for this repository.
-        </p>
-      </div>
+    <section className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-5">
+      <h2 className="text-[1.125rem] font-semibold tracking-tight text-[var(--ink-primary)]">
+        Test configuration
+      </h2>
 
       <form className="mt-4 space-y-4" onSubmit={handleSubmit}>
-        <div className="grid gap-4 md:grid-cols-2">
-          <div>
-            <label
-              htmlFor="test-command"
-              className="block text-sm font-medium text-neutral-200"
-            >
-              Test command
-            </label>
-            <input
-              id="test-command"
-              type="text"
-              value={testCommand}
-              onChange={(event) => {
-                setTestCommand(event.target.value);
-                setJustSaved(false);
-              }}
-              placeholder="Auto-detected — e.g. pytest <changed test files> / vitest run <changed test files>"
-              autoComplete="off"
-              spellCheck={false}
-              className="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm text-neutral-100 placeholder:font-sans placeholder:text-neutral-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-            />
-            <p className="mt-1 text-xs text-neutral-500">
-              Leave empty to let DiffProve detect the runner from the lockfile and
-              project files.
-            </p>
-          </div>
-
-          <div>
-            <label
-              htmlFor="test-file-globs"
-              className="block text-sm font-medium text-neutral-200"
-            >
-              Test file globs
-            </label>
-            <input
-              id="test-file-globs"
-              type="text"
-              value={globsText}
-              onChange={(event) => {
-                setGlobsText(event.target.value);
-                setJustSaved(false);
-              }}
-              placeholder="Comma-separated, e.g. test_*.py, *_test.py, *.test.ts, *.spec.ts"
-              autoComplete="off"
-              spellCheck={false}
-              className="mt-1 w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm text-neutral-100 placeholder:font-sans placeholder:text-neutral-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-            />
-            <p className="mt-1 text-xs text-neutral-500">
-              Leave empty to use the default globs for the repository language.
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
+        <div>
+          <label
+            htmlFor="test-command"
+            className="block text-[0.875rem] font-medium text-[var(--ink-primary)]"
+          >
+            Test command
+          </label>
           <input
-            id="enabled"
-            type="checkbox"
-            checked={enabled}
+            id="test-command"
+            type="text"
+            value={testCommand}
             onChange={(event) => {
-              setEnabled(event.target.checked);
+              setTestCommand(event.target.value);
               setJustSaved(false);
             }}
-            className="h-4 w-4 rounded border-neutral-600 bg-neutral-950 accent-emerald-500"
+            placeholder="e.g. pytest -q {files} or npx vitest run {files}"
+            autoComplete="off"
+            spellCheck={false}
+            className="mt-1.5 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 font-mono text-[0.8125rem] text-[var(--ink-primary)] placeholder:font-sans placeholder:text-[var(--ink-muted)] focus:border-[var(--accent)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
           />
-          <label htmlFor="enabled" className="text-sm font-medium text-neutral-200">
-            Enabled
-          </label>
-          <span className="text-xs text-neutral-500">
-            When off, new verification jobs stay queued instead of running.
-          </span>
+          <p className="mt-1.5 text-[0.8125rem] leading-relaxed text-[var(--ink-muted)]">
+            Leave empty for auto-detection. Use {'{files}'} to pass changed test paths.
+          </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
+        <div>
+          <label
+            htmlFor="test-file-globs"
+            className="block text-[0.875rem] font-medium text-[var(--ink-primary)]"
+          >
+            Test file globs
+          </label>
+          <input
+            id="test-file-globs"
+            type="text"
+            value={globsText}
+            onChange={(event) => {
+              setGlobsText(event.target.value);
+              setJustSaved(false);
+            }}
+            placeholder="e.g. test_*.py, *_test.py, *.test.ts, *.spec.ts"
+            autoComplete="off"
+            spellCheck={false}
+            className="mt-1.5 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 font-mono text-[0.8125rem] text-[var(--ink-primary)] placeholder:font-sans placeholder:text-[var(--ink-muted)] focus:border-[var(--accent)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+          />
+          <p className="mt-1.5 text-[0.8125rem] leading-relaxed text-[var(--ink-muted)]">
+            Leave empty to use default globs for the repository language.
+          </p>
+        </div>
+
+        <div className="border-t border-[var(--border-hairline)] pt-4">
+          <div className="flex items-start gap-2.5">
+            <input
+              id="enabled"
+              type="checkbox"
+              checked={enabled}
+              onChange={(event) => {
+                setEnabled(event.target.checked);
+                setJustSaved(false);
+              }}
+              className="mt-0.5 h-4 w-4 rounded border-[var(--border-strong)] bg-[var(--bg-surface)] accent-[var(--accent)]"
+            />
+            <div>
+              <label
+                htmlFor="enabled"
+                className="block text-[0.875rem] font-medium text-[var(--ink-primary)]"
+              >
+                Enable differential verification
+              </label>
+              <p className="mt-0.5 text-[0.8125rem] leading-relaxed text-[var(--ink-muted)]">
+                When disabled, new PR jobs stay queued without running.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 pt-1">
           <button
             type="submit"
             disabled={saving}
-            className="rounded-lg bg-emerald-500 px-3 py-2 text-sm font-semibold text-neutral-950 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex items-center justify-center rounded-md bg-[var(--accent)] px-4 py-2 text-[0.875rem] font-medium text-white transition-colors duration-150 hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {saving ? 'Saving…' : 'Save configuration'}
+            {saving ? 'Saving...' : 'Save configuration'}
           </button>
 
           {error === null ? null : (
-            <p role="alert" className="text-sm text-red-300">
+            <p role="alert" className="text-[0.8125rem] font-medium text-red-800">
               {error}
             </p>
           )}
 
           {error === null && justSaved ? (
-            <p role="status" className="text-sm text-emerald-300">
+            <p role="status" className="text-[0.8125rem] font-medium text-emerald-800">
               Configuration saved.
             </p>
           ) : null}

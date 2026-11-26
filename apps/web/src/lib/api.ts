@@ -83,6 +83,19 @@ export interface RepoConfigPatch {
   enabled?: boolean;
 }
 
+/** Signed-in GitHub user returned by `GET /api/auth/session`. */
+export interface AuthUser {
+  id: number;
+  login: string;
+  avatarUrl: string | null;
+}
+
+/** Current OAuth configuration and signed-in session from `GET /api/auth/session`. */
+export interface AuthSession {
+  oauthEnabled: boolean;
+  user: AuthUser | null;
+}
+
 /** Reported when the response body is not the shape this client expects. */
 const BAD_GATEWAY_STATUS = 502;
 
@@ -270,6 +283,18 @@ function parseRunRow(value: unknown): RunRow {
   };
 }
 
+function parseAuthUser(value: unknown): AuthUser | null {
+  if (value === null) {
+    return null;
+  }
+  const source = requireObject(value, 'auth user');
+  return {
+    id: readNumber(source, 'id'),
+    login: readString(source, 'login'),
+    avatarUrl: readNullableString(source, 'avatarUrl'),
+  };
+}
+
 /** Response text, or `''` when the body could not be read at all. */
 async function readBodyText(response: Response): Promise<string> {
   try {
@@ -313,12 +338,18 @@ async function requestJson(path: string, init: RequestInit = {}): Promise<unknow
 
   let response: Response;
   try {
-    // `cache: 'no-store'` keeps run history and config fresh after a save.
-    response = await fetch(`${API_BASE}${path}`, { ...init, headers, cache: 'no-store' });
+    // `cache: 'no-store'` keeps run history and config fresh after a save, and
+    // `credentials: 'same-origin'` ensures session cookies are always sent.
+    response = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      credentials: 'same-origin',
+      headers,
+      cache: 'no-store',
+    });
   } catch {
     throw new ApiError(
       UNREACHABLE_STATUS,
-      `could not reach the DiffProve service at ${API_BASE} — is it running?`,
+      `could not reach the DiffProve service at ${API_BASE || 'this origin'}: is it running?`,
     );
   }
 
@@ -364,4 +395,18 @@ export async function patchRepoConfig(id: string, patch: RepoConfigPatch): Promi
     'updated repository row',
   );
   return parseRepoRow(body['repository']);
+}
+
+/** `GET /api/auth/session`: returns OAuth status and the signed-in user if any. */
+export async function getAuthSession(): Promise<AuthSession> {
+  const body = requireObject(await requestJson('/api/auth/session'), 'auth session');
+  return {
+    oauthEnabled: readBoolean(body, 'oauthEnabled'),
+    user: parseAuthUser(body['user']),
+  };
+}
+
+/** `POST /api/auth/logout`: clears the session cookie on the service. */
+export async function logout(): Promise<void> {
+  await requestJson('/api/auth/logout', { method: 'POST' });
 }

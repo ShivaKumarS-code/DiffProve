@@ -74,7 +74,9 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
   }
 
   /** Creates a fresh repository row with a unique name for this test run. */
-  async function createRepository(language: 'python' | 'node' = 'node'): Promise<RepositoryRow> {
+  async function createRepository(
+    language: 'python' | 'node' | null = 'node',
+  ): Promise<RepositoryRow> {
     return repositories.ensureRepository({
       repoFullName: uniqueRepoFullName(),
       installationId: null,
@@ -169,6 +171,33 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
     expect(repeated.installationId).toBe(created.installationId);
 
     await expect(repositories.getRepository(created.id)).resolves.toEqual(repeated);
+  });
+
+  it('accepts language: null on onboarding and preserves an existing language on later null calls', async () => {
+    const repoFullName = uniqueRepoFullName();
+
+    const onboarded = await repositories.ensureRepository({
+      repoFullName,
+      installationId: null,
+      language: null,
+    });
+    expect(onboarded.language).toBeNull();
+
+    const detected = await repositories.ensureRepository({
+      repoFullName,
+      installationId: null,
+      language: 'python',
+    });
+    expect(detected.id).toBe(onboarded.id);
+    expect(detected.language).toBe('python');
+
+    const reonboarded = await repositories.ensureRepository({
+      repoFullName,
+      installationId: null,
+      language: null,
+    });
+    expect(reonboarded.id).toBe(onboarded.id);
+    expect(reonboarded.language).toBe('python');
   });
 
   it('patches only supplied config fields and clears overrides with explicit null', async () => {

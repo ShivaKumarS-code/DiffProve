@@ -9,35 +9,78 @@
 @source "../components";
 
 /*
- * Typography uses plain CSS font stacks on purpose: Next's Google-font loader
- * fetches font files over the network at build time, which would make the
- * dashboard build fail (or silently fall back) in offline and CI environments.
+ * Typography loads Plus Jakarta Sans and JetBrains Mono via a Google Fonts
+ * stylesheet link in layout.tsx so `next build` never fetches fonts at build
+ * time, while Tailwind `font-sans` and `font-mono` resolve cleanly with system
+ * fallbacks when offline.
  */
+@theme inline {
+  --font-sans:
+    "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "Noto Sans", sans-serif;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
 :root {
-  color-scheme: dark;
+  color-scheme: light;
+  --bg-canvas: #F6F7F8;
+  --bg-surface: #FFFFFF;
+  --bg-recessed: #F0F2F5;
+  --bg-hover: #ECEFF3;
+  --border-hairline: #DDE1E7;
+  --border-strong: #C5CBD4;
+  --ink-primary: #11161D;
+  --ink-secondary: #454E5B;
+  --ink-muted: #5D6775;
+  --accent: #1D4ED8;
+  --accent-hover: #1E40AF;
+  --accent-tint: #EFF6FF;
+  --text-heading: 1.125rem;
+  --text-body: 0.9375rem;
+  --text-sm: 0.8125rem;
 }
 
 html {
   height: 100%;
+  background-color: var(--bg-canvas);
+  color: var(--ink-primary);
 }
 
 body {
   min-height: 100%;
-  font-family:
-    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  background-color: var(--bg-canvas);
+  color: var(--ink-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-body);
+  line-height: 1.5;
 }
 
 code,
 kbd,
 pre,
 samp {
-  font-family:
-    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
+  font-family: var(--font-mono);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Log output is rendered in <pre>; two-space tabs keep sandbox output aligned. */
 pre {
   tab-size: 2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

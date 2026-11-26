@@ -10,9 +10,10 @@
  * Security (architecture guardrail #2): secrets must never be logged or
  * leaked. Consequently the error messages below name the offending variable
  * but never echo its value for `GITHUB_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`,
- * `E2B_API_KEY`, `REDIS_URL`, or `DATABASE_URL` (the last two may embed
- * credentials). Only non-secret, enumerated values such as `PORT`, `LOG_LEVEL`,
- * and the E2B timeouts are quoted back.
+ * `GITHUB_CLIENT_SECRET`, `SESSION_SECRET`, `E2B_API_KEY`, `REDIS_URL`, or
+ * `DATABASE_URL` (the last two may embed credentials). Only non-secret,
+ * enumerated values such as `PORT`, `LOG_LEVEL`, `PUBLIC_URL`, and the E2B
+ * timeouts are quoted back.
  */
 
 /** Validated runtime configuration for the GitHub App server. */
@@ -33,6 +34,23 @@ export interface AppConfig {
   /** PEM text with real newlines, ready to hand to `@octokit/auth-app`. */
   githubPrivateKey: string;
   webhookSecret: string;
+  /** GitHub App OAuth client id; null when OAuth login is disabled. */
+  githubClientId: string | null;
+  /**
+   * GitHub App OAuth client secret; null when OAuth login is disabled.
+   * Secret — never echoed in errors or logs.
+   */
+  githubClientSecret: string | null;
+  /**
+   * HMAC secret for signing dashboard session cookies (>= 16 chars when set);
+   * null when OAuth login is disabled. Secret — never echoed in errors or logs.
+   */
+  sessionSecret: string | null;
+  /**
+   * Public HTTP(S) origin of the server (e.g. `https://diffprove.example.com`)
+   * with trailing slashes stripped; null when unset.
+   */
+  publicUrl: string | null;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   /**
    * E2B API key for the differential sandbox runner. Null when sandbox
@@ -73,6 +91,7 @@ const DEFAULT_E2B_INSTALL_TIMEOUT_MS = 240_000;
 
 const MIN_PORT = 1;
 const MAX_PORT = 65535;
+const MIN_SESSION_SECRET_LENGTH = 16;
 
 const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
 
@@ -81,6 +100,9 @@ const REDIS_URL_SCHEMES = ['redis://', 'rediss://'] as const;
 
 /** Accepted PostgreSQL URI schemes. */
 const DATABASE_URL_SCHEMES = ['postgres://', 'postgresql://'] as const;
+
+/** Accepted public HTTP(S) origin schemes. */
+const PUBLIC_URL_SCHEMES = ['http://', 'https://'] as const;
 
 const DIGITS_ONLY = /^\d+$/;
 
@@ -282,11 +304,89 @@ function parseTimeoutMs(
 }
 
 /**
+ * Parse GitHub App OAuth settings (`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`,
+ * `SESSION_SECRET`). Optional as a group: when all three are unset/blank,
+ * OAuth login is disabled and all three resolve to null. If any one is set,
+ * all three are required together.
+ *
+ * Security: `GITHUB_CLIENT_SECRET` and `SESSION_SECRET` are never echoed in
+ * error messages.
+ */
+function parseOAuthConfig(
+  env: Record<string, string | undefined>,
+  problems: string[],
+): {
+  githubClientId: string | null;
+  githubClientSecret: string | null;
+  sessionSecret: string | null;
+} {
+  const githubClientId = readValue(env, 'GITHUB_CLIENT_ID');
+  const githubClientSecret = readValue(env, 'GITHUB_CLIENT_SECRET');
+  const sessionSecret = readValue(env, 'SESSION_SECRET');
+
+  if (
+    githubClientId === undefined &&
+    githubClientSecret === undefined &&
+    sessionSecret === undefined
+  ) {
+    return {
+      githubClientId: null,
+      githubClientSecret: null,
+      sessionSecret: null,
+    };
+  }
+
+  const entries: ReadonlyArray<readonly [string, string | undefined]> = [
+    ['GITHUB_CLIENT_ID', githubClientId],
+    ['GITHUB_CLIENT_SECRET', githubClientSecret],
+    ['SESSION_SECRET', sessionSecret],
+  ];
+
+  for (const [name, value] of entries) {
+    if (value === undefined) {
+      problems.push(
+        `${name}: is required when GitHub OAuth is enabled (GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, and SESSION_SECRET must all be set together)`,
+      );
+    }
+  }
+
+  if (sessionSecret !== undefined && sessionSecret.length < MIN_SESSION_SECRET_LENGTH) {
+    // Never echo the value: it is a secret, even when too short.
+    problems.push(
+      `SESSION_SECRET: must be at least ${MIN_SESSION_SECRET_LENGTH} characters long (the value is not shown because it is a secret)`,
+    );
+  }
+
+  return {
+    githubClientId: githubClientId ?? null,
+    githubClientSecret: githubClientSecret ?? null,
+    sessionSecret: sessionSecret ?? null,
+  };
+}
+
+function parsePublicUrl(
+  value: string | undefined,
+  problems: string[],
+): string | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!PUBLIC_URL_SCHEMES.some((scheme) => value.startsWith(scheme))) {
+    problems.push(
+      `PUBLIC_URL: must start with "http://" or "https://" (got ${JSON.stringify(value)})`,
+    );
+    return null;
+  }
+  return value.replace(/\/+$/, '');
+}
+
+/**
  * Validate an environment bag and return a frozen-by-convention `AppConfig`.
  *
  * Defaults: `PORT=3000`, `REDIS_URL=redis://127.0.0.1:6379` (matches
  * `docker compose up -d redis`), no `DATABASE_URL` (run history, repo config,
- * and installation persistence disabled), `LOG_LEVEL=info`, no E2B API key or
+ * and installation persistence disabled), no GitHub OAuth or `PUBLIC_URL`
+ * (dashboard OAuth login disabled), `LOG_LEVEL=info`, no E2B API key or
  * template (sandbox execution disabled), `E2B_TEST_TIMEOUT_MS=120000`,
  * `E2B_INSTALL_TIMEOUT_MS=240000`.
  *
@@ -314,6 +414,11 @@ export function loadConfig(
     readValue(env, 'GITHUB_WEBHOOK_SECRET'),
     problems,
   );
+  const { githubClientId, githubClientSecret, sessionSecret } = parseOAuthConfig(
+    env,
+    problems,
+  );
+  const publicUrl = parsePublicUrl(readValue(env, 'PUBLIC_URL'), problems);
   const logLevel = parseLogLevel(readValue(env, 'LOG_LEVEL'), problems);
 
   // Optional E2B sandbox settings: absent means "sandbox disabled", so the
@@ -348,6 +453,10 @@ export function loadConfig(
     githubAppId,
     githubPrivateKey,
     webhookSecret,
+    githubClientId,
+    githubClientSecret,
+    sessionSecret,
+    publicUrl,
     logLevel,
     e2bApiKey,
     e2bTemplateId,

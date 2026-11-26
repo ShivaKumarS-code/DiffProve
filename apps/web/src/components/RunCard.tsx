@@ -4,41 +4,43 @@ import type { RunRow } from '../lib/api';
 import VerdictBadge from './VerdictBadge';
 
 /**
- * One verification run: the PR it belongs to, the verdict, both sandbox
- * statuses, timing, the changed test files, and the Run A / Run B log excerpts.
+ * One verification run rendered as a flat ledger entry: the PR it belongs to,
+ * the verdict, both sandbox statuses, timing, the changed test files, and the
+ * Run A / Run B log excerpts.
  *
  * Logs live inside `<details>` elements so a long history stays scannable while
  * the raw output is still one click away.
  */
 
-const STATUS_CHIP_CLASSES: Record<string, string> = {
-  pass: 'border-green-500/30 bg-green-500/10 text-green-300',
-  fail: 'border-red-500/30 bg-red-500/10 text-red-300',
-  'import-error': 'border-blue-500/30 bg-blue-500/10 text-blue-300',
-  'syntax-error': 'border-blue-500/30 bg-blue-500/10 text-blue-300',
-  timeout: 'border-amber-500/30 bg-amber-500/10 text-amber-300',
-  error: 'border-red-500/30 bg-red-500/10 text-red-300',
+const STATUS_TEXT_CLASSES: Record<string, string> = {
+  pass: 'text-emerald-700',
+  fail: 'text-red-700',
+  'import-error': 'text-blue-700',
+  'syntax-error': 'text-blue-700',
+  timeout: 'text-amber-700',
+  error: 'text-red-700',
 };
 
-const FALLBACK_STATUS_CLASSES = 'border-neutral-500/30 bg-neutral-500/10 text-neutral-300';
+const FALLBACK_STATUS_TEXT_CLASS = 'text-[var(--ink-muted)]';
 
-function StatusChip({ run, status }: { run: 'A' | 'B'; status: string }) {
+function RunStatusLabel({ run, status }: { run: 'A' | 'B'; status: string }) {
   return (
-    <span
-      className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px] ${
-        STATUS_CHIP_CLASSES[status] ?? FALLBACK_STATUS_CLASSES
-      }`}
-      title={`Run ${run} status`}
-    >
-      <span className="font-sans text-neutral-400">run {run}</span>
-      {status}
+    <span className="text-[var(--ink-muted)]" title={`Run ${run} status`}>
+      Run {run}:{' '}
+      <span
+        className={`font-mono font-medium ${
+          STATUS_TEXT_CLASSES[status] ?? FALLBACK_STATUS_TEXT_CLASS
+        }`}
+      >
+        {status}
+      </span>
     </span>
   );
 }
 
 function formatDuration(durationMs: number): string {
   if (!Number.isFinite(durationMs) || durationMs < 0) {
-    return '—';
+    return '-';
   }
   return `${(durationMs / 1000).toFixed(1)}s`;
 }
@@ -64,12 +66,14 @@ function LogDetails({
   const hasLog = log.trim().length > 0;
 
   return (
-    <details className="overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950/60">
-      <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-neutral-300 transition-colors hover:bg-neutral-900/60 hover:text-neutral-100">
+    <details className="overflow-hidden rounded-md bg-[var(--bg-recessed)]">
+      <summary className="cursor-pointer select-none px-3 py-2 text-[0.8125rem] font-medium text-[var(--ink-primary)] transition-colors duration-150">
         {label}
-        {hasLog ? null : <span className="ml-2 font-normal text-neutral-500">(empty)</span>}
+        {hasLog ? null : (
+          <span className="ml-2 font-normal text-[var(--ink-muted)]">(empty)</span>
+        )}
       </summary>
-      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-neutral-800 px-3 py-2 text-xs leading-relaxed text-neutral-300">
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-[var(--border-hairline)] px-3 py-2.5 font-mono text-[0.8125rem] leading-relaxed text-[var(--ink-primary)]">
         {hasLog ? log : emptyText}
       </pre>
     </details>
@@ -78,50 +82,63 @@ function LogDetails({
 
 export default function RunCard({ run }: { run: RunRow }) {
   return (
-    <article className="rounded-xl border border-neutral-800 bg-neutral-900/60 p-4">
-      <header className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <span className="text-sm font-semibold text-neutral-100">PR #{run.prNumber}</span>
-        <VerdictBadge verdict={run.verdict} />
-        <StatusChip run="A" status={run.runAStatus} />
-        <StatusChip run="B" status={run.runBStatus} />
-        <span className="text-xs text-neutral-400">{formatDuration(run.durationMs)}</span>
-        <span className="ml-auto text-xs text-neutral-400">
-          {formatCreatedAt(run.createdAt)}
-        </span>
+    <article className="px-5 py-5">
+      <header className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+          <span className="text-[0.9375rem] font-semibold text-[var(--ink-primary)] tabular-nums">
+            PR #{run.prNumber}
+          </span>
+          <VerdictBadge verdict={run.verdict} />
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.8125rem]">
+            <RunStatusLabel run="A" status={run.runAStatus} />
+            <span className="text-[var(--ink-muted)]" aria-hidden="true">
+              vs
+            </span>
+            <RunStatusLabel run="B" status={run.runBStatus} />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.8125rem] text-[var(--ink-muted)] tabular-nums">
+          <span>{formatDuration(run.durationMs)}</span>
+          <span aria-hidden="true">·</span>
+          <time dateTime={run.createdAt}>{formatCreatedAt(run.createdAt)}</time>
+        </div>
       </header>
 
-      <p className="mt-2 font-mono text-[11px] text-neutral-500">
-        {shortSha(run.baseSha)} → {shortSha(run.headSha)}
-      </p>
+      <div className="mt-2.5 flex flex-col gap-1.5 text-[0.8125rem]">
+        <p className="font-mono text-[0.8125rem] text-[var(--ink-muted)] tabular-nums">
+          {shortSha(run.baseSha)} -&gt; {shortSha(run.headSha)}
+        </p>
 
-      <div className="mt-3">
-        <h3 className="text-xs font-medium uppercase tracking-wide text-neutral-500">
-          Changed test files
-        </h3>
-        {run.changedTestFiles.length === 0 ? (
-          <p className="mt-1 text-xs text-neutral-500">None recorded.</p>
-        ) : (
-          <ul className="mt-1 flex flex-wrap gap-1.5">
-            {run.changedTestFiles.map((file, index) => (
-              <li
-                key={`${file}-${String(index)}`}
-                className="rounded bg-neutral-800/80 px-1.5 py-0.5 font-mono text-[11px] text-neutral-300"
-              >
-                {file}
-              </li>
-            ))}
-          </ul>
-        )}
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="font-medium text-[var(--ink-muted)]">Changed test files:</span>
+          {run.changedTestFiles.length === 0 ? (
+            <span className="text-[var(--ink-muted)]">None recorded.</span>
+          ) : (
+            <ul className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 font-mono text-[0.8125rem] text-[var(--ink-primary)]">
+              {run.changedTestFiles.map((file, index) => (
+                <li key={`${file}-${String(index)}`} className="break-all">
+                  {file}
+                  {index < run.changedTestFiles.length - 1 ? (
+                    <span className="text-[var(--ink-muted)]" aria-hidden="true">
+                      ,
+                    </span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </div>
 
-      <div className="mt-3 space-y-2">
+      <div className="mt-3.5 grid gap-3 border-t border-[var(--border-hairline)] pt-3 md:grid-cols-2">
         <LogDetails
-          label="Run A log — base commit + changed tests (expected: fail)"
+          label="Run A log (base + changed tests, expected: fail)"
           log={run.runALog}
           emptyText="No log output was captured for Run A."
         />
         <LogDetails
-          label="Run B log — head commit + changed tests (expected: pass)"
+          label="Run B log (head + changed tests, expected: pass)"
           log={run.runBLog}
           emptyText="No log output was captured for Run B."
         />

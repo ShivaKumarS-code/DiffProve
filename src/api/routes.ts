@@ -23,10 +23,12 @@
  * invalid body) are mapped to 400/404.
  */
 
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
+import type { SessionPayload } from '../auth/session.js';
 import type { RepositoryStore, VerificationRunStore } from '../db/types.js';
+import { readSessionFromRequest, type AuthDeps } from './auth-routes.js';
 
 export interface ApiDeps {
   repositories: RepositoryStore;
@@ -37,6 +39,8 @@ export interface ApiDeps {
 const DATABASE_NOT_CONFIGURED_STATUS = 503;
 
 const BAD_REQUEST_STATUS = 400;
+const UNAUTHORIZED_STATUS = 401;
+const FORBIDDEN_STATUS = 403;
 const NOT_FOUND_STATUS = 404;
 
 /** `GET /api/repos/:id/runs` default page size (matches the store's default). */
@@ -106,12 +110,59 @@ function summarizeValidationError(error: z.ZodError): string {
   return path === '' ? issue.message : `${path}: ${issue.message}`;
 }
 
-export function registerApiRoutes(app: FastifyInstance, deps: ApiDeps | null): void {
-  app.get('/api/repos', async (_request, reply) => {
+/**
+ * Authenticates the request when OAuth is enabled. Returns `null` after sending
+ * the 401 response if authentication fails, or `undefined` when OAuth is
+ * disabled (`auth === null`).
+ */
+function resolveAuthorizedSession(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  auth: AuthDeps | null,
+): SessionPayload | null | undefined {
+  if (auth === null) {
+    return undefined;
+  }
+  const session = readSessionFromRequest(request, auth.sessionSecret);
+  if (session === null) {
+    reply.code(UNAUTHORIZED_STATUS).send({ message: 'authentication required' });
+    return null;
+  }
+  return session;
+}
+
+export function registerApiRoutes(
+  app: FastifyInstance,
+  deps: ApiDeps | null,
+  auth: AuthDeps | null = null,
+): void {
+  app.get('/api/repos', async (request, reply) => {
     // Copy into a local so the null check narrows the captured dependency.
     const stores = deps;
     if (stores === null) {
       return databaseNotConfigured(reply);
+    }
+
+    const session = resolveAuthorizedSession(request, reply, auth);
+    if (session === null) {
+      return reply;
+    }
+
+    if (auth !== null && session !== undefined) {
+      const accessible = await auth.githubOAuth.listAccessibleRepos(session.accessToken);
+      const repos = await Promise.all(
+        accessible.map((repo) =>
+          stores.repositories.ensureRepository({
+            repoFullName: repo.repoFullName,
+            installationId: repo.installationId,
+            language: repo.languageHint,
+          }),
+        ),
+      );
+      repos.sort((a, b) =>
+        a.repoFullName < b.repoFullName ? -1 : a.repoFullName > b.repoFullName ? 1 : 0,
+      );
+      return { repos };
     }
 
     return { repos: await stores.repositories.listRepositories() };
@@ -123,6 +174,11 @@ export function registerApiRoutes(app: FastifyInstance, deps: ApiDeps | null): v
       const stores = deps;
       if (stores === null) {
         return databaseNotConfigured(reply);
+      }
+
+      const session = resolveAuthorizedSession(request, reply, auth);
+      if (session === null) {
+        return reply;
       }
 
       const { id } = request.params;
@@ -140,6 +196,15 @@ export function registerApiRoutes(app: FastifyInstance, deps: ApiDeps | null): v
         return reply.code(NOT_FOUND_STATUS).send({ message: 'repository not found' });
       }
 
+      if (auth !== null && session !== undefined) {
+        const accessible = await auth.githubOAuth.listAccessibleRepos(session.accessToken);
+        if (!accessible.some((repo) => repo.repoFullName === repository.repoFullName)) {
+          return reply
+            .code(FORBIDDEN_STATUS)
+            .send({ message: 'you do not have access to this repository' });
+        }
+      }
+
       // Spread the summary (`runs`, `totalRuns`, `weakTestCount`, `catchRate`)
       // so the dashboard receives the whole history contract in one response.
       return { repository, ...(await stores.runs.listRuns(id, limit)) };
@@ -154,6 +219,11 @@ export function registerApiRoutes(app: FastifyInstance, deps: ApiDeps | null): v
         return databaseNotConfigured(reply);
       }
 
+      const session = resolveAuthorizedSession(request, reply, auth);
+      if (session === null) {
+        return reply;
+      }
+
       const { id } = request.params;
       if (!UUID_PATTERN.test(id)) {
         return reply.code(BAD_REQUEST_STATUS).send({ message: 'invalid repository id' });
@@ -164,6 +234,28 @@ export function registerApiRoutes(app: FastifyInstance, deps: ApiDeps | null): v
         return reply
           .code(BAD_REQUEST_STATUS)
           .send({ message: summarizeValidationError(parsed.error) });
+      }
+
+      if (auth !== null && session !== undefined) {
+        const existing = await stores.repositories.getRepository(id);
+        if (existing === null) {
+          return reply.code(NOT_FOUND_STATUS).send({ message: 'repository not found' });
+        }
+
+        const accessible = await auth.githubOAuth.listAccessibleRepos(session.accessToken);
+        const match = accessible.find(
+          (repo) => repo.repoFullName === existing.repoFullName,
+        );
+        if (!match) {
+          return reply
+            .code(FORBIDDEN_STATUS)
+            .send({ message: 'you do not have access to this repository' });
+        }
+        if (!match.canWrite) {
+          return reply
+            .code(FORBIDDEN_STATUS)
+            .send({ message: 'write or admin permission required to update configuration' });
+        }
       }
 
       const repository = await stores.repositories.updateRepositoryConfig(id, parsed.data);
