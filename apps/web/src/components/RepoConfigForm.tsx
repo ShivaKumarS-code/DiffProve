@@ -80,8 +80,8 @@ export default function RepoConfigForm({
   }
 
   return (
-    <section className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-5">
-      <h2 className="text-[1.125rem] font-semibold tracking-tight text-[var(--ink-primary)]">
+    <section className="glass-panel rounded-2xl p-5 sm:p-6">
+      <h2 className="text-[1.125rem] font-semibold tracking-tight text-white">
         Test configuration
       </h2>
 
@@ -89,7 +89,7 @@ export default function RepoConfigForm({
         <div>
           <label
             htmlFor="test-command"
-            className="block text-[0.875rem] font-medium text-[var(--ink-primary)]"
+            className="block text-[0.875rem] font-medium text-slate-100"
           >
             Test command
           </label>
@@ -104,9 +104,9 @@ export default function RepoConfigForm({
             placeholder="e.g. pytest -q {files} or npx vitest run {files}"
             autoComplete="off"
             spellCheck={false}
-            className="mt-1.5 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 font-mono text-[0.8125rem] text-[var(--ink-primary)] placeholder:font-sans placeholder:text-[var(--ink-muted)] focus:border-[var(--accent)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+            className="mt-1.5 w-full rounded-xl border border-white/15 bg-[#060813]/85 px-3.5 py-2.5 font-mono text-[0.8125rem] text-white placeholder:font-sans placeholder:text-slate-500 focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-400"
           />
-          <p className="mt-1.5 text-[0.8125rem] leading-relaxed text-[var(--ink-muted)]">
+          <p className="mt-1.5 text-[0.8125rem] leading-relaxed text-slate-400">
             Leave empty for auto-detection. Use {'{files}'} to pass changed test paths.
           </p>
         </div>
@@ -114,7 +114,7 @@ export default function RepoConfigForm({
         <div>
           <label
             htmlFor="test-file-globs"
-            className="block text-[0.875rem] font-medium text-[var(--ink-primary)]"
+            className="block text-[0.875rem] font-medium text-slate-100"
           >
             Test file globs
           </label>
@@ -129,14 +129,14 @@ export default function RepoConfigForm({
             placeholder="e.g. test_*.py, *_test.py, *.test.ts, *.spec.ts"
             autoComplete="off"
             spellCheck={false}
-            className="mt-1.5 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 py-2 font-mono text-[0.8125rem] text-[var(--ink-primary)] placeholder:font-sans placeholder:text-[var(--ink-muted)] focus:border-[var(--accent)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+            className="mt-1.5 w-full rounded-xl border border-white/15 bg-[#060813]/85 px-3.5 py-2.5 font-mono text-[0.8125rem] text-white placeholder:font-sans placeholder:text-slate-500 focus:border-indigo-400 focus:outline-none focus:ring-1 focus:ring-indigo-400"
           />
-          <p className="mt-1.5 text-[0.8125rem] leading-relaxed text-[var(--ink-muted)]">
+          <p className="mt-1.5 text-[0.8125rem] leading-relaxed text-slate-400">
             Leave empty to use default globs for the repository language.
           </p>
         </div>
 
-        <div className="border-t border-[var(--border-hairline)] pt-4">
+        <div className="border-t border-white/10 pt-4">
           <div className="flex items-start gap-2.5">
             <input
               id="enabled"
@@ -146,16 +146,16 @@ export default function RepoConfigForm({
                 setEnabled(event.target.checked);
                 setJustSaved(false);
               }}
-              className="mt-0.5 h-4 w-4 rounded border-[var(--border-strong)] bg-[var(--bg-surface)] accent-[var(--accent)]"
+              className="mt-0.5 h-4 w-4 rounded border-white/25 bg-[#060813]/85 accent-[#4f6bff]"
             />
             <div>
               <label
                 htmlFor="enabled"
-                className="block text-[0.875rem] font-medium text-[var(--ink-primary)]"
+                className="block text-[0.875rem] font-medium text-slate-100"
               >
                 Enable differential verification
               </label>
-              <p className="mt-0.5 text-[0.8125rem] leading-relaxed text-[var(--ink-muted)]">
+              <p className="mt-0.5 text-[0.8125rem] leading-relaxed text-slate-400">
                 When disabled, new PR jobs stay queued without running.
               </p>
             </div>
@@ -166,19 +166,19 @@ export default function RepoConfigForm({
           <button
             type="submit"
             disabled={saving}
-            className="inline-flex items-center justify-center rounded-md bg-[var(--accent)] px-4 py-2 text-[0.875rem] font-medium text-white transition-colors duration-150 hover:bg-[var(--accent-hover)] disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex items-center justify-center rounded-xl bg-[#4f6bff] px-4 py-2.5 text-[0.875rem] font-medium text-white shadow-[0_0_24px_rgba(79,107,255,0.3)] transition-colors duration-150 hover:bg-[#6780ff] disabled:cursor-not-allowed disabled:opacity-60"
           >
             {saving ? 'Saving...' : 'Save configuration'}
           </button>
 
           {error === null ? null : (
-            <p role="alert" className="text-[0.8125rem] font-medium text-red-800">
+            <p role="alert" className="text-[0.8125rem] font-medium text-red-300">
               {error}
             </p>
           )}
 
           {error === null && justSaved ? (
-            <p role="status" className="text-[0.8125rem] font-medium text-emerald-800">
+            <p role="status" className="text-[0.8125rem] font-medium text-emerald-300">
               Configuration saved.
             </p>
           ) : null}

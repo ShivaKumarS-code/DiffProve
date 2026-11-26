@@ -13,19 +13,19 @@ import VerdictBadge from './VerdictBadge';
  */
 
 const STATUS_TEXT_CLASSES: Record<string, string> = {
-  pass: 'text-emerald-700',
-  fail: 'text-red-700',
-  'import-error': 'text-blue-700',
-  'syntax-error': 'text-blue-700',
-  timeout: 'text-amber-700',
-  error: 'text-red-700',
+  pass: 'text-emerald-300',
+  fail: 'text-rose-300',
+  'import-error': 'text-indigo-300',
+  'syntax-error': 'text-indigo-300',
+  timeout: 'text-amber-300',
+  error: 'text-rose-300',
 };
 
-const FALLBACK_STATUS_TEXT_CLASS = 'text-[var(--ink-muted)]';
+const FALLBACK_STATUS_TEXT_CLASS = 'text-slate-300';
 
 function RunStatusLabel({ run, status }: { run: 'A' | 'B'; status: string }) {
   return (
-    <span className="text-[var(--ink-muted)]" title={`Run ${run} status`}>
+    <span className="text-slate-400" title={`Run ${run} status`}>
       Run {run}:{' '}
       <span
         className={`font-mono font-medium ${
@@ -66,14 +66,14 @@ function LogDetails({
   const hasLog = log.trim().length > 0;
 
   return (
-    <details className="overflow-hidden rounded-md bg-[var(--bg-recessed)]">
-      <summary className="cursor-pointer select-none px-3 py-2 text-[0.8125rem] font-medium text-[var(--ink-primary)] transition-colors duration-150">
+    <details className="overflow-hidden rounded-xl border border-white/10 bg-[#060814]/85">
+      <summary className="cursor-pointer select-none px-3.5 py-2.5 text-[0.8125rem] font-medium text-slate-200 transition-colors duration-150 hover:bg-white/[0.04] hover:text-white">
         {label}
         {hasLog ? null : (
-          <span className="ml-2 font-normal text-[var(--ink-muted)]">(empty)</span>
+          <span className="ml-2 font-normal text-slate-400">(empty)</span>
         )}
       </summary>
-      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-[var(--border-hairline)] px-3 py-2.5 font-mono text-[0.8125rem] leading-relaxed text-[var(--ink-primary)]">
+      <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words border-t border-white/10 px-3.5 py-3 font-mono text-[0.8125rem] leading-relaxed text-slate-200">
         {hasLog ? log : emptyText}
       </pre>
     </details>
@@ -82,23 +82,23 @@ function LogDetails({
 
 export default function RunCard({ run }: { run: RunRow }) {
   return (
-    <article className="px-5 py-5">
+    <article className="px-5 py-5 sm:px-6 transition-colors duration-150 hover:bg-white/[0.025]">
       <header className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <span className="text-[0.9375rem] font-semibold text-[var(--ink-primary)] tabular-nums">
+          <span className="text-[0.9375rem] font-semibold text-white tabular-nums">
             PR #{run.prNumber}
           </span>
           <VerdictBadge verdict={run.verdict} />
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.8125rem]">
             <RunStatusLabel run="A" status={run.runAStatus} />
-            <span className="text-[var(--ink-muted)]" aria-hidden="true">
+            <span className="text-slate-400" aria-hidden="true">
               vs
             </span>
             <RunStatusLabel run="B" status={run.runBStatus} />
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.8125rem] text-[var(--ink-muted)] tabular-nums">
+        <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.8125rem] text-slate-400 tabular-nums">
           <span>{formatDuration(run.durationMs)}</span>
           <span aria-hidden="true">·</span>
           <time dateTime={run.createdAt}>{formatCreatedAt(run.createdAt)}</time>
@@ -106,21 +106,21 @@ export default function RunCard({ run }: { run: RunRow }) {
       </header>
 
       <div className="mt-2.5 flex flex-col gap-1.5 text-[0.8125rem]">
-        <p className="font-mono text-[0.8125rem] text-[var(--ink-muted)] tabular-nums">
+        <p className="font-mono text-[0.8125rem] text-slate-400 tabular-nums">
           {shortSha(run.baseSha)} -&gt; {shortSha(run.headSha)}
         </p>
 
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-          <span className="font-medium text-[var(--ink-muted)]">Changed test files:</span>
+          <span className="font-medium text-slate-400">Changed test files:</span>
           {run.changedTestFiles.length === 0 ? (
-            <span className="text-[var(--ink-muted)]">None recorded.</span>
+            <span className="text-slate-400">None recorded.</span>
           ) : (
-            <ul className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 font-mono text-[0.8125rem] text-[var(--ink-primary)]">
+            <ul className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 font-mono text-[0.8125rem] text-slate-200">
               {run.changedTestFiles.map((file, index) => (
                 <li key={`${file}-${String(index)}`} className="break-all">
                   {file}
                   {index < run.changedTestFiles.length - 1 ? (
-                    <span className="text-[var(--ink-muted)]" aria-hidden="true">
+                    <span className="text-slate-400" aria-hidden="true">
                       ,
                     </span>
                   ) : null}
@@ -131,7 +131,7 @@ export default function RunCard({ run }: { run: RunRow }) {
         </div>
       </div>
 
-      <div className="mt-3.5 grid gap-3 border-t border-[var(--border-hairline)] pt-3 md:grid-cols-2">
+      <div className="mt-3.5 grid gap-3 border-t border-white/10 pt-3 md:grid-cols-2">
         <LogDetails
           label="Run A log (base + changed tests, expected: fail)"
           log={run.runALog}

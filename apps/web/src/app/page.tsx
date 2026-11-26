@@ -19,6 +19,8 @@ import { getRepos, toApiError, type ApiError, type RepoRow } from '../lib/api';
 const DATABASE_HINT =
   'Start Postgres (`docker compose up -d postgres`) and set DATABASE_URL on the service.';
 
+const COVERAGE_TICK_COUNT = 28;
+
 type StatusFilter = 'all' | 'enabled' | 'disabled';
 
 function languageLabel(language: RepoRow['language']): string {
@@ -34,10 +36,10 @@ function languageLabel(language: RepoRow['language']): string {
 function StatusIndicator({ enabled }: { enabled: boolean }) {
   return (
     <span
-      className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[0.8125rem] font-medium ${
+      className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[0.8125rem] font-medium ${
         enabled
-          ? 'border-[#A7F3D0] bg-[#ECFDF5] text-[#065F46]'
-          : 'border-[#CBD5E1] bg-[#F1F5F9] text-[#475569]'
+          ? 'border-emerald-400/35 bg-emerald-500/15 text-emerald-200'
+          : 'border-white/15 bg-white/[0.06] text-slate-300'
       }`}
     >
       {enabled ? 'Enabled' : 'Disabled'}
@@ -47,13 +49,10 @@ function StatusIndicator({ enabled }: { enabled: boolean }) {
 
 function RepoListSkeleton() {
   return (
-    <div
-      role="status"
-      className="space-y-2.5 rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-4"
-    >
+    <div role="status" className="glass-panel space-y-2.5 rounded-2xl p-5">
       <span className="sr-only">Loading repositories...</span>
       {[0, 1, 2].map((row) => (
-        <div key={row} className="h-10 animate-pulse rounded-md bg-[var(--bg-recessed)]" />
+        <div key={row} className="h-10 animate-pulse rounded-lg bg-white/[0.06]" />
       ))}
     </div>
   );
@@ -63,12 +62,15 @@ function ErrorBanner({ error, onRetry }: { error: ApiError; onRetry: () => void 
   const databaseNotConfigured = error.message.includes('database not configured');
 
   return (
-    <div role="alert" className="rounded-lg border border-red-300 bg-red-50 p-4 text-red-900">
-      <p className="text-[0.9375rem] font-semibold text-red-900">Could not load repositories</p>
-      <p className="mt-1 break-words text-[0.875rem] text-red-800">{error.message}</p>
+    <div
+      role="alert"
+      className="rounded-2xl border border-red-400/30 bg-red-950/55 p-5 text-red-200 backdrop-blur-xl"
+    >
+      <p className="text-[0.9375rem] font-semibold text-white">Could not load repositories</p>
+      <p className="mt-1 break-words text-[0.875rem] text-red-200">{error.message}</p>
 
       {databaseNotConfigured ? (
-        <p className="mt-3 rounded-md border border-red-200 bg-[var(--bg-surface)] px-3 py-2 text-[0.8125rem] text-[var(--ink-secondary)]">
+        <p className="mt-3 rounded-xl border border-red-400/25 bg-[#060812]/80 px-3.5 py-2.5 text-[0.8125rem] text-slate-200">
           Setup: {DATABASE_HINT}
         </p>
       ) : null}
@@ -76,7 +78,7 @@ function ErrorBanner({ error, onRetry }: { error: ApiError; onRetry: () => void 
       <button
         type="button"
         onClick={onRetry}
-        className="mt-3 inline-flex items-center rounded-md border border-red-300 bg-[var(--bg-surface)] px-3 py-1.5 text-[0.8125rem] font-medium text-red-900 transition-colors duration-150 hover:bg-red-100"
+        className="mt-4 inline-flex items-center rounded-lg border border-red-400/35 bg-white/[0.08] px-3.5 py-1.5 text-[0.8125rem] font-medium text-white transition-colors duration-150 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300/60"
       >
         Retry
       </button>
@@ -94,16 +96,16 @@ function AuthErrorBanner({
   return (
     <div
       role="alert"
-      className="flex flex-wrap items-start justify-between gap-3 rounded-lg border border-red-300 bg-red-50 p-4 text-red-900"
+      className="flex flex-wrap items-start justify-between gap-3 rounded-2xl border border-red-400/30 bg-red-950/55 p-5 text-red-200 backdrop-blur-xl"
     >
       <div className="space-y-1">
-        <p className="text-[0.9375rem] font-semibold text-red-900">GitHub sign-in failed</p>
-        <p className="break-words text-[0.875rem] text-red-800">{message}</p>
+        <p className="text-[0.9375rem] font-semibold text-white">GitHub sign-in failed</p>
+        <p className="break-words text-[0.875rem] text-red-200">{message}</p>
       </div>
       <button
         type="button"
         onClick={onDismiss}
-        className="rounded-md border border-red-300 bg-[var(--bg-surface)] px-3 py-1.5 text-[0.8125rem] font-medium text-red-900 transition-colors duration-150 hover:bg-red-100"
+        className="rounded-lg border border-red-400/35 bg-white/[0.08] px-3.5 py-1.5 text-[0.8125rem] font-medium text-white transition-colors duration-150 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300/60"
       >
         Dismiss
       </button>
@@ -113,24 +115,92 @@ function AuthErrorBanner({
 
 function SignInGate() {
   return (
-    <section
-      aria-label="Sign in required"
-      className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-6 sm:p-8"
-    >
-      <h2 className="text-[1.125rem] font-semibold tracking-tight text-[var(--ink-primary)]">
+    <section aria-label="Sign in required" className="glass-panel rounded-2xl p-6 sm:p-8">
+      <h2 className="text-[1.125rem] font-semibold tracking-tight text-white">
         Sign in to view repositories
       </h2>
-      <p className="mt-2 max-w-[65ch] text-[0.9375rem] text-[var(--ink-secondary)]">
+      <p className="mt-2 max-w-[65ch] text-[0.9375rem] text-slate-300">
         DiffProve scopes dashboard history and configuration to the GitHub repositories you have
         access to.
       </p>
       <div className="mt-5">
         <a
           href="/api/auth/login"
-          className="inline-flex items-center rounded-md bg-[var(--accent)] px-4 py-2 text-[0.875rem] font-medium text-white transition-colors duration-150 hover:bg-[var(--accent-hover)]"
+          className="inline-flex items-center rounded-xl bg-[#4f6bff] px-4 py-2.5 text-[0.875rem] font-semibold text-white shadow-[0_0_24px_rgba(79,107,255,0.35)] transition-colors duration-150 hover:bg-[#6780ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300"
         >
           Sign in with GitHub
         </a>
+      </div>
+    </section>
+  );
+}
+
+function CoverageOverview({
+  totalCount,
+  enabledCount,
+  customCommandCount,
+}: {
+  totalCount: number;
+  enabledCount: number;
+  customCommandCount: number;
+}) {
+  const pausedCount = totalCount - enabledCount;
+  const coveragePercent = totalCount > 0 ? Math.round((enabledCount / totalCount) * 100) : 0;
+  const litTicks =
+    totalCount > 0 ? Math.round((enabledCount / totalCount) * COVERAGE_TICK_COUNT) : 0;
+
+  const metrics = [
+    { label: 'Connected repositories', value: totalCount },
+    { label: 'Verification enabled', value: enabledCount },
+    { label: 'Custom test commands', value: customCommandCount },
+    { label: 'Paused', value: pausedCount },
+  ];
+
+  return (
+    <section aria-label="Verification coverage overview" className="glass-panel rounded-2xl p-6 sm:p-7">
+      <div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)] md:items-center">
+        <div className="space-y-2">
+          <p className="text-[0.875rem] font-medium text-slate-300">Verification coverage</p>
+          <p className="text-5xl font-light leading-none tracking-[-0.04em] tabular-nums text-white sm:text-[3.25rem]">
+            {coveragePercent}%
+          </p>
+        </div>
+
+        <dl className="space-y-0.5">
+          {metrics.map((metric) => (
+            <div
+              key={metric.label}
+              className="flex items-center justify-between py-1.5 text-[0.875rem]"
+            >
+              <dt className="text-slate-300">{metric.label}</dt>
+              <dd className="font-medium tabular-nums text-white">{metric.value}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+
+      <div className="mt-6 border-t border-white/10 pt-5">
+        <div aria-hidden="true" className="flex h-6 items-stretch gap-1 sm:gap-1.5">
+          {Array.from({ length: COVERAGE_TICK_COUNT }, (_, index) => {
+            const lit = index < litTicks;
+            return (
+              <span
+                key={index}
+                className={`flex-1 rounded-full ${
+                  lit
+                    ? 'bg-gradient-to-b from-[#6ee7b7] to-[#818cf8]'
+                    : 'bg-white/15'
+                }`}
+              />
+            );
+          })}
+        </div>
+        <div className="mt-2.5 flex items-center justify-between text-[0.8125rem] text-slate-300">
+          <span>Enabled coverage</span>
+          <span className="tabular-nums text-slate-200">
+            {enabledCount} of {totalCount} active
+          </span>
+        </div>
       </div>
     </section>
   );
@@ -145,14 +215,14 @@ function RepoTable({
 }) {
   if (repos.length === 0) {
     return (
-      <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-6 py-10 text-center">
-        <p className="text-[0.875rem] text-[var(--ink-secondary)]">
+      <div className="glass-panel rounded-2xl px-6 py-10 text-center">
+        <p className="text-[0.875rem] text-slate-300">
           No repositories match your current search or status filter.
         </p>
         <button
           type="button"
           onClick={onResetFilters}
-          className="mt-3 text-[0.875rem] font-medium text-[var(--accent)] underline underline-offset-4 transition-colors duration-150 hover:text-[var(--accent-hover)]"
+          className="mt-3 inline-flex items-center rounded-lg border border-white/15 bg-white/[0.06] px-3.5 py-1.5 text-[0.8125rem] font-medium text-indigo-200 transition-colors duration-150 hover:border-indigo-400/40 hover:bg-white/[0.1] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/60"
         >
           Reset filters
         </button>
@@ -161,70 +231,69 @@ function RepoTable({
   }
 
   return (
-    <div className="overflow-x-auto rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)]">
-      <table className="min-w-full divide-y divide-[var(--border-hairline)] text-[0.875rem]">
-        <caption className="sr-only">Repositories registered with the DiffProve GitHub App</caption>
-        <thead className="bg-[var(--bg-recessed)] text-left text-[0.8125rem] text-[var(--ink-secondary)]">
-          <tr>
-            <th scope="col" className="px-4 py-3 font-medium">
-              Repository
-            </th>
-            <th scope="col" className="px-4 py-3 font-medium">
-              Language
-            </th>
-            <th scope="col" className="px-4 py-3 font-medium">
-              Status
-            </th>
-            <th scope="col" className="px-4 py-3 font-medium">
-              Test command
-            </th>
-            <th scope="col" className="px-4 py-3 text-right font-medium">
-              Details
-            </th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-[var(--border-hairline)]">
-          {repos.map((repo) => (
-            <tr
-              key={repo.id}
-              className="transition-colors duration-150 hover:bg-[var(--bg-hover)]"
-            >
-              <td className="px-4 py-3 font-medium text-[var(--ink-primary)]">
-                <Link
-                  href={`/repos/${repo.id}`}
-                  className="transition-colors duration-150 hover:text-[var(--accent)]"
-                >
-                  {repo.repoFullName}
-                </Link>
-              </td>
-              <td className="px-4 py-3 text-[var(--ink-secondary)]">
-                {languageLabel(repo.language)}
-              </td>
-              <td className="px-4 py-3">
-                <StatusIndicator enabled={repo.enabled} />
-              </td>
-              <td className="px-4 py-3">
-                {repo.testCommand === null ? (
-                  <span className="text-[0.8125rem] text-[var(--ink-muted)]">Auto-detected</span>
-                ) : (
-                  <code className="rounded bg-[var(--bg-recessed)] px-2 py-0.5 font-mono text-[0.8125rem] text-[var(--ink-primary)]">
-                    {repo.testCommand}
-                  </code>
-                )}
-              </td>
-              <td className="px-4 py-3 text-right">
-                <Link
-                  href={`/repos/${repo.id}`}
-                  aria-label={`Inspect ${repo.repoFullName}`}
-                  className="inline-flex items-center text-[0.8125rem] font-medium text-[var(--accent)] transition-colors duration-150 hover:text-[var(--accent-hover)]"
-                >
-                  Inspect -&gt;
-                </Link>
-              </td>
+    <div className="glass-panel overflow-hidden rounded-2xl">
+      <div className="overflow-x-auto">
+        <table className="min-w-full divide-y divide-white/10 text-[0.875rem]">
+          <caption className="sr-only">
+            Repositories registered with the DiffProve GitHub App
+          </caption>
+          <thead className="bg-white/[0.03] text-left text-[0.8125rem] text-slate-300">
+            <tr>
+              <th scope="col" className="px-4 py-3 font-medium">
+                Repository
+              </th>
+              <th scope="col" className="px-4 py-3 font-medium">
+                Language
+              </th>
+              <th scope="col" className="px-4 py-3 font-medium">
+                Status
+              </th>
+              <th scope="col" className="px-4 py-3 font-medium">
+                Test command
+              </th>
+              <th scope="col" className="px-4 py-3 text-right font-medium">
+                Details
+              </th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody className="divide-y divide-white/10">
+            {repos.map((repo) => (
+              <tr key={repo.id} className="transition-colors duration-150 hover:bg-white/[0.04]">
+                <td className="px-4 py-3.5 font-medium text-white">
+                  <Link
+                    href={`/repos/${repo.id}`}
+                    className="rounded transition-colors duration-150 hover:text-indigo-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/60"
+                  >
+                    {repo.repoFullName}
+                  </Link>
+                </td>
+                <td className="px-4 py-3.5 text-slate-300">{languageLabel(repo.language)}</td>
+                <td className="px-4 py-3.5">
+                  <StatusIndicator enabled={repo.enabled} />
+                </td>
+                <td className="px-4 py-3.5">
+                  {repo.testCommand === null ? (
+                    <span className="text-[0.8125rem] text-slate-400">Auto-detected</span>
+                  ) : (
+                    <code className="rounded-md border border-white/10 bg-[#060812]/90 px-2 py-0.5 font-mono text-[0.8125rem] text-indigo-200">
+                      {repo.testCommand}
+                    </code>
+                  )}
+                </td>
+                <td className="px-4 py-3.5 text-right">
+                  <Link
+                    href={`/repos/${repo.id}`}
+                    aria-label={`Inspect ${repo.repoFullName}`}
+                    className="inline-flex items-center rounded text-[0.8125rem] font-medium text-indigo-300 transition-colors duration-150 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/60"
+                  >
+                    Inspect -&gt;
+                  </Link>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -308,10 +377,10 @@ export default function ReposPage() {
   return (
     <div className="space-y-6">
       <header className="space-y-2">
-        <h1 className="text-[clamp(1.75rem,2.5vw,2.25rem)] font-bold leading-tight tracking-[-0.03em] text-[var(--ink-primary)]">
+        <h1 className="text-[clamp(1.75rem,3vw,2.5rem)] font-bold leading-tight tracking-[-0.03em] text-white">
           Repositories
         </h1>
-        <p className="max-w-3xl text-[0.9375rem] text-[var(--ink-secondary)]">
+        <p className="max-w-[65ch] text-[0.9375rem] text-slate-300">
           Catch weak or hallucinated pull request tests automatically before review, and inspect
           verification configuration across connected repositories.
         </p>
@@ -332,62 +401,69 @@ export default function ReposPage() {
       ) : null}
 
       {showEmpty ? (
-        <p className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-6 text-[0.875rem] text-[var(--ink-secondary)]">
+        <p className="glass-panel rounded-2xl p-6 text-[0.875rem] text-slate-300">
           No repositories yet. Install the GitHub App on a repository and open a pull request to
           begin verification.
         </p>
       ) : null}
 
       {showLedger ? (
-        <section aria-label="Connected repositories" className="space-y-3">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex flex-1 flex-col gap-2.5 sm:flex-row sm:items-center">
-              <div className="w-full sm:max-w-xs">
-                <label htmlFor="repo-search" className="sr-only">
-                  Search repositories or test commands
-                </label>
-                <input
-                  id="repo-search"
-                  type="search"
-                  value={searchQuery}
-                  onChange={(event) => setSearchQuery(event.target.value)}
-                  placeholder="Filter by repository or test command..."
-                  className="w-full rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-1.5 text-[0.875rem] text-[var(--ink-primary)] placeholder:text-[var(--ink-muted)] transition-colors duration-150 focus:border-[var(--accent)] focus:outline-none"
-                />
+        <>
+          <CoverageOverview
+            totalCount={totalCount}
+            enabledCount={enabledCount}
+            customCommandCount={customCommandCount}
+          />
+
+          <section id="repositories" aria-label="Connected repositories" className="space-y-3.5">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex flex-1 flex-col gap-2.5 sm:flex-row sm:items-center">
+                <div className="w-full sm:max-w-xs">
+                  <label htmlFor="repo-search" className="sr-only">
+                    Search repositories or test commands
+                  </label>
+                  <input
+                    id="repo-search"
+                    type="search"
+                    value={searchQuery}
+                    onChange={(event) => setSearchQuery(event.target.value)}
+                    placeholder="Filter by repository or test command..."
+                    className="glass-control w-full rounded-xl border border-white/15 bg-[#070914]/80 px-3.5 py-2 text-[0.875rem] text-white placeholder:text-slate-400 transition-colors duration-150 focus:border-indigo-400 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="repo-status-filter" className="sr-only">
+                    Filter by status
+                  </label>
+                  <select
+                    id="repo-status-filter"
+                    value={statusFilter}
+                    onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
+                    className="glass-control w-full rounded-xl border border-white/15 bg-[#070914]/80 px-3.5 py-2 text-[0.875rem] text-white transition-colors duration-150 focus:border-indigo-400 focus:outline-none sm:w-auto"
+                  >
+                    <option value="all" className="bg-[#090d1a] text-white">
+                      All repositories
+                    </option>
+                    <option value="enabled" className="bg-[#090d1a] text-white">
+                      Enabled only
+                    </option>
+                    <option value="disabled" className="bg-[#090d1a] text-white">
+                      Disabled only
+                    </option>
+                  </select>
+                </div>
               </div>
 
-              <div>
-                <label htmlFor="repo-status-filter" className="sr-only">
-                  Filter by status
-                </label>
-                <select
-                  id="repo-status-filter"
-                  value={statusFilter}
-                  onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
-                  className="w-full rounded-md border border-[var(--border-hairline)] bg-[var(--bg-surface)] px-3 py-1.5 text-[0.875rem] text-[var(--ink-primary)] transition-colors duration-150 focus:border-[var(--accent)] focus:outline-none sm:w-auto"
-                >
-                  <option value="all">All repositories</option>
-                  <option value="enabled">Enabled only</option>
-                  <option value="disabled">Disabled only</option>
-                </select>
-              </div>
+              <p className="text-[0.8125rem] tabular-nums text-slate-300">
+                Showing {filteredRepos.length} of {totalCount}{' '}
+                {totalCount === 1 ? 'repository' : 'repositories'}
+              </p>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3 text-[0.8125rem] tabular-nums text-[var(--ink-secondary)]">
-              <span>
-                {totalCount} {totalCount === 1 ? 'repository' : 'repositories'}
-              </span>
-              <span aria-hidden="true" className="h-3.5 w-px bg-[var(--border-hairline)]" />
-              <span>{enabledCount} enabled</span>
-              <span aria-hidden="true" className="h-3.5 w-px bg-[var(--border-hairline)]" />
-              <span>
-                {customCommandCount} custom {customCommandCount === 1 ? 'command' : 'commands'}
-              </span>
-            </div>
-          </div>
-
-          <RepoTable repos={filteredRepos} onResetFilters={resetFilters} />
-        </section>
+            <RepoTable repos={filteredRepos} onResetFilters={resetFilters} />
+          </section>
+        </>
       ) : null}
     </div>
   );
