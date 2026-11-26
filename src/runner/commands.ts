@@ -93,10 +93,10 @@ export function buildInstallCommand(files: readonly string[], kind: RunnerKind):
     // Python installers, most reproducible first. A requirements.txt path may
     // be nested, so the matched path is POSIX single-quoted.
     if (findFile(files, 'uv.lock') !== null) {
-      return 'uv sync';
+      return '(command -v uv >/dev/null 2>&1 || pip install -q uv) && uv sync';
     }
     if (findFile(files, 'poetry.lock') !== null) {
-      return 'POETRY_VIRTUALENVS_IN_PROJECT=true poetry install';
+      return '(command -v poetry >/dev/null 2>&1 || pip install -q poetry) && POETRY_VIRTUALENVS_IN_PROJECT=true poetry install';
     }
     const requirements = findFile(files, 'requirements.txt');
     if (requirements !== null) {
@@ -113,7 +113,7 @@ export function buildInstallCommand(files: readonly string[], kind: RunnerKind):
     return 'npm ci';
   }
   if (findFile(files, 'pnpm-lock.yaml') !== null) {
-    return 'pnpm install --frozen-lockfile';
+    return 'npx --yes pnpm install --frozen-lockfile';
   }
   if (findFile(files, 'yarn.lock') !== null) {
     return 'yarn install --frozen-lockfile';

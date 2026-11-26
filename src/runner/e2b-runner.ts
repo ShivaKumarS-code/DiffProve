@@ -24,12 +24,12 @@ import type {
   SandboxRawResult,
 } from './types.js';
 
-const WORKSPACE = '/workspace';
-const RUN_A = '/run-a';
-const RUN_B = '/run-b';
 const STAGING = '/tmp/diffprove';
+const WORKSPACE = '/tmp/diffprove/workspace';
+const RUN_A = '/tmp/diffprove/run-a';
+const RUN_B = '/tmp/diffprove/run-b';
 
-/** Untars the base tree into an empty /workspace; `--strip-components=1` drops the repo-<sha> root. */
+/** Untars the base tree into an empty workspace; `--strip-components=1` drops the repo-<sha> root. */
 const EXTRACT = `mkdir -p ${WORKSPACE} && tar -xzf ${STAGING}/base.tar.gz -C ${WORKSPACE} --strip-components=1`;
 
 const DEFAULT_INSTALL_TIMEOUT_MS = 240_000;
@@ -58,7 +58,7 @@ function describeError(error: unknown): string {
  * turn infrastructure flakiness into a wrong verdict.
  */
 function isFailedStep(result: SandboxRawResult): boolean {
-  return result.timedOut || (result.exitCode !== null && result.exitCode !== 0);
+  return result.timedOut || result.exitCode !== 0;
 }
 
 /** One run's raw result for a prep step that failed before any test ran. */
@@ -98,6 +98,33 @@ function testCommandForRun(request: DifferentialRunRequest): string {
     : request.testCommand;
 }
 
+/**
+ * Rewrites hardcoded workspace paths inside a copied `.venv` so editable
+ * installs (`.pth` / `__editable__*.py`) and `.venv/bin/*` scripts resolve
+ * against `runDir` instead of the shared base workspace.
+ */
+function relocateVenvCommand(runDir: string): string {
+  const script = [
+    'from pathlib import Path',
+    `venv = Path("${runDir}/.venv")`,
+    'targets = (',
+    '    list(venv.glob("lib/*/site-packages/*.pth"))',
+    '    + list(venv.glob("lib/*/site-packages/__editable__*.py"))',
+    '    + list(venv.glob("bin/*"))',
+    ')',
+    'for p in targets:',
+    '    if not p.is_file() or p.is_symlink():',
+    '        continue',
+    '    try:',
+    '        text = p.read_text(encoding="utf-8")',
+    '    except (UnicodeDecodeError, OSError):',
+    '        continue',
+    `    if "${WORKSPACE}" in text:`,
+    `        p.write_text(text.replace("${WORKSPACE}", "${runDir}"), encoding="utf-8")`,
+  ].join('\n');
+  return `if [ -d ${runDir}/.venv ]; then python3 -c '${script}'; fi`;
+}
+
 export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRunner {
   const installTimeoutMs = deps.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS;
   const testTimeoutMs = deps.testTimeoutMs ?? DEFAULT_TEST_TIMEOUT_MS;
@@ -128,16 +155,22 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
       await sandbox.writeFile(`${STAGING}/full.patch`, request.fullDiff);
 
       if (cached !== null) {
-        // Snapshot HIT: /workspace holds the tree of the PR that produced the
+        // Snapshot HIT: workspace holds the tree of the PR that produced the
         // snapshot (stale) but its dependency environment matches this lockfile
-        // hash (valid). Rescue workspace deps with mv across the /workspace
+        // hash (valid). Rescue workspace deps with mv across the workspace
         // reset so thousands of files aren't copied before rm -rf.
         const depsDir = request.runnerKind === 'pytest' ? '.venv' : 'node_modules';
         await sandbox.run(`mv ${WORKSPACE}/${depsDir} ${STAGING}/${depsDir} 2>/dev/null || true`);
-        await sandbox.run(`rm -rf ${WORKSPACE} && ${EXTRACT}`);
+        const reset = await sandbox.run(`rm -rf ${WORKSPACE} && ${EXTRACT}`);
+        if (isFailedStep(reset)) {
+          return failedPrepPair('workspace extraction', reset);
+        }
         await sandbox.run(`mv ${STAGING}/${depsDir} ${WORKSPACE}/${depsDir} 2>/dev/null || true`);
       } else {
-        await sandbox.run(EXTRACT);
+        const extract = await sandbox.run(EXTRACT);
+        if (isFailedStep(extract)) {
+          return failedPrepPair('workspace extraction', extract);
+        }
 
         if (request.installCommand !== null) {
           const install = await sandbox.run(request.installCommand, {
@@ -154,7 +187,7 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
       // Only a cold run produced a complete, reusable environment from scratch.
       // A HIT boots from an existing snapshot and would just re-snapshot the
       // same deps, so it is skipped. Snapshotting before cloning, patching, and
-      // running tests keeps untrusted PR code and /run-a /run-b out of it.
+      // running tests keeps untrusted PR code and run-a / run-b trees out of it.
       if (cached === null && deps.snapshotCache) {
         const ref = await sandbox.createSnapshot(`diffprove-${request.lockfileKey}`);
         if (ref !== null) {
@@ -170,8 +203,27 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
 
       // Two independent trees: Run A gets base + Test-Only Patch, Run B gets
       // base + Full PR Patch. Both start from the same provisioned base.
-      await sandbox.run(`cp -a ${WORKSPACE} ${RUN_A}`);
-      await sandbox.run(`cp -a ${WORKSPACE} ${RUN_B}`);
+      for (const [label, runDir] of [
+        ['run-a workspace copy', RUN_A],
+        ['run-b workspace copy', RUN_B],
+      ] as const) {
+        const copy = await sandbox.run(`cp -a ${WORKSPACE} ${runDir}`);
+        if (isFailedStep(copy)) {
+          return failedPrepPair(label, copy);
+        }
+      }
+
+      if (request.runnerKind === 'pytest') {
+        for (const [label, runDir] of [
+          ['run-a .venv relocation', RUN_A],
+          ['run-b .venv relocation', RUN_B],
+        ] as const) {
+          const relocate = await sandbox.run(relocateVenvCommand(runDir));
+          if (isFailedStep(relocate)) {
+            return failedPrepPair(label, relocate);
+          }
+        }
+      }
 
       const testOnlyApply = await sandbox.run(
         `git apply --whitespace=nowarn ${STAGING}/test-only.patch`,

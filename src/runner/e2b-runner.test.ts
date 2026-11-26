@@ -10,8 +10,37 @@ import type {
   SandboxRawResult,
 } from './types.js';
 
-const EXTRACT =
-  'mkdir -p /workspace && tar -xzf /tmp/diffprove/base.tar.gz -C /workspace --strip-components=1';
+const STAGING = '/tmp/diffprove';
+const WORKSPACE = `${STAGING}/workspace`;
+const RUN_A = `${STAGING}/run-a`;
+const RUN_B = `${STAGING}/run-b`;
+
+const EXTRACT = `mkdir -p ${WORKSPACE} && tar -xzf ${STAGING}/base.tar.gz -C ${WORKSPACE} --strip-components=1`;
+
+function relocateVenv(runDir: string): string {
+  const script = [
+    'from pathlib import Path',
+    `venv = Path("${runDir}/.venv")`,
+    'targets = (',
+    '    list(venv.glob("lib/*/site-packages/*.pth"))',
+    '    + list(venv.glob("lib/*/site-packages/__editable__*.py"))',
+    '    + list(venv.glob("bin/*"))',
+    ')',
+    'for p in targets:',
+    '    if not p.is_file() or p.is_symlink():',
+    '        continue',
+    '    try:',
+    '        text = p.read_text(encoding="utf-8")',
+    '    except (UnicodeDecodeError, OSError):',
+    '        continue',
+    `    if "${WORKSPACE}" in text:`,
+    `        p.write_text(text.replace("${WORKSPACE}", "${runDir}"), encoding="utf-8")`,
+  ].join('\n');
+  return `if [ -d ${runDir}/.venv ]; then python3 -c '${script}'; fi`;
+}
+
+const RELOCATE_RUN_A = relocateVenv(RUN_A);
+const RELOCATE_RUN_B = relocateVenv(RUN_B);
 
 const PYTEST_TEST_COMMAND = 'export PATH="$PWD/.venv/bin:$PATH"; pytest "tests/test_a.py"';
 
@@ -166,15 +195,17 @@ describe('createE2bDifferentialRunner', () => {
       'write /tmp/diffprove/test-only.patch',
       'write /tmp/diffprove/full.patch',
       `run ${EXTRACT} (cwd=-, timeout=-)`,
-      'run pip install -e . -r requirements.txt (cwd=/workspace, timeout=240000)',
+      `run pip install -e . -r requirements.txt (cwd=${WORKSPACE}, timeout=240000)`,
       'snapshot diffprove-lock-abc123',
-      'run cp -a /workspace /run-a (cwd=-, timeout=-)',
-      'run cp -a /workspace /run-b (cwd=-, timeout=-)',
-      'run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=/run-a, timeout=30000)',
-      'run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=/run-b, timeout=30000)',
+      `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
+      `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
+      `run ${RELOCATE_RUN_A} (cwd=-, timeout=-)`,
+      `run ${RELOCATE_RUN_B} (cwd=-, timeout=-)`,
+      `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
+      `run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=${RUN_B}, timeout=30000)`,
       'network denyAll=true',
-      `run ${PYTEST_TEST_COMMAND} (cwd=/run-a, timeout=120000)`,
-      `run ${PYTEST_TEST_COMMAND} (cwd=/run-b, timeout=120000)`,
+      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_A}, timeout=120000)`,
+      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_B}, timeout=120000)`,
       'close',
     ]);
 
@@ -225,21 +256,22 @@ describe('createE2bDifferentialRunner', () => {
       'write /tmp/diffprove/base.tar.gz',
       'write /tmp/diffprove/test-only.patch',
       'write /tmp/diffprove/full.patch',
-      'run mv /workspace/node_modules /tmp/diffprove/node_modules 2>/dev/null || true (cwd=-, timeout=-)',
-      `run rm -rf /workspace && ${EXTRACT} (cwd=-, timeout=-)`,
-      'run mv /tmp/diffprove/node_modules /workspace/node_modules 2>/dev/null || true (cwd=-, timeout=-)',
-      'run cp -a /workspace /run-a (cwd=-, timeout=-)',
-      'run cp -a /workspace /run-b (cwd=-, timeout=-)',
-      'run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=/run-a, timeout=30000)',
-      'run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=/run-b, timeout=30000)',
+      `run mv ${WORKSPACE}/node_modules /tmp/diffprove/node_modules 2>/dev/null || true (cwd=-, timeout=-)`,
+      `run rm -rf ${WORKSPACE} && ${EXTRACT} (cwd=-, timeout=-)`,
+      `run mv /tmp/diffprove/node_modules ${WORKSPACE}/node_modules 2>/dev/null || true (cwd=-, timeout=-)`,
+      `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
+      `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
+      `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
+      `run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=${RUN_B}, timeout=30000)`,
       'network denyAll=true',
-      'run npx vitest run tests/a.test.ts (cwd=/run-a, timeout=120000)',
-      'run npx vitest run tests/a.test.ts (cwd=/run-b, timeout=120000)',
+      `run npx vitest run tests/a.test.ts (cwd=${RUN_A}, timeout=120000)`,
+      `run npx vitest run tests/a.test.ts (cwd=${RUN_B}, timeout=120000)`,
       'close',
     ]);
 
-    // A HIT already owns a valid environment: no install, no re-snapshot.
+    // A HIT already owns a valid environment: no install, no re-snapshot, no .venv relocation.
     expect(runCalls(calls).map((call) => call.command)).not.toContain('npm ci');
+    expect(runCalls(calls).some((call) => call.command.includes('.venv'))).toBe(false);
     expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
     expect(set).not.toHaveBeenCalled();
   });
@@ -262,16 +294,18 @@ describe('createE2bDifferentialRunner', () => {
       'write /tmp/diffprove/base.tar.gz',
       'write /tmp/diffprove/test-only.patch',
       'write /tmp/diffprove/full.patch',
-      'run mv /workspace/.venv /tmp/diffprove/.venv 2>/dev/null || true (cwd=-, timeout=-)',
-      `run rm -rf /workspace && ${EXTRACT} (cwd=-, timeout=-)`,
-      'run mv /tmp/diffprove/.venv /workspace/.venv 2>/dev/null || true (cwd=-, timeout=-)',
-      'run cp -a /workspace /run-a (cwd=-, timeout=-)',
-      'run cp -a /workspace /run-b (cwd=-, timeout=-)',
-      'run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=/run-a, timeout=30000)',
-      'run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=/run-b, timeout=30000)',
+      `run mv ${WORKSPACE}/.venv /tmp/diffprove/.venv 2>/dev/null || true (cwd=-, timeout=-)`,
+      `run rm -rf ${WORKSPACE} && ${EXTRACT} (cwd=-, timeout=-)`,
+      `run mv /tmp/diffprove/.venv ${WORKSPACE}/.venv 2>/dev/null || true (cwd=-, timeout=-)`,
+      `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
+      `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
+      `run ${RELOCATE_RUN_A} (cwd=-, timeout=-)`,
+      `run ${RELOCATE_RUN_B} (cwd=-, timeout=-)`,
+      `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
+      `run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=${RUN_B}, timeout=30000)`,
       'network denyAll=true',
-      `run ${PYTEST_TEST_COMMAND} (cwd=/run-a, timeout=120000)`,
-      `run ${PYTEST_TEST_COMMAND} (cwd=/run-b, timeout=120000)`,
+      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_A}, timeout=120000)`,
+      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_B}, timeout=120000)`,
       'close',
     ]);
     expect(
@@ -318,12 +352,159 @@ describe('createE2bDifferentialRunner', () => {
     expect(result.runA).not.toBe(result.runB);
 
     const commands = runCalls(calls).map((call) => call.command);
-    expect(commands).not.toContain('cp -a /workspace /run-a');
-    expect(commands).not.toContain('cp -a /workspace /run-b');
+    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
+    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_B}`);
     expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
     expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
     expect(set).not.toHaveBeenCalled();
     expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
+  });
+
+  it('aborts both runs when base workspace extraction fails', async () => {
+    const extractFailure: SandboxRawResult = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'tar: Cannot open: Permission denied',
+      timedOut: false,
+      durationMs: 15,
+    };
+    const { factory, calls } = createFakeFactory({
+      onRun: (command) => (command === EXTRACT ? extractFailure : ok()),
+    });
+    const { cache, set } = createFakeCache();
+    const { logger } = createLogger();
+    const request = createRequest();
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    const result = await runner(request);
+
+    const expected: SandboxRawResult = {
+      exitCode: null,
+      stdout: '',
+      stderr: 'workspace extraction failed:\ntar: Cannot open: Permission denied',
+      timedOut: false,
+      durationMs: 15,
+    };
+    expect(result.runA).toEqual(expected);
+    expect(result.runB).toEqual(expected);
+    expect(runCalls(calls).map((call) => call.command)).toEqual([EXTRACT]);
+    expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
+    expect(set).not.toHaveBeenCalled();
+    expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
+  });
+
+  it('aborts both runs when workspace copy fails', async () => {
+    const copyFailure: SandboxRawResult = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'cp: cannot create directory',
+      timedOut: false,
+      durationMs: 22,
+    };
+    const { factory, calls } = createFakeFactory({
+      onRun: (command) => (command === `cp -a ${WORKSPACE} ${RUN_A}` ? copyFailure : ok()),
+    });
+    const { cache } = createFakeCache();
+    const { logger } = createLogger();
+    const request = createRequest();
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    const result = await runner(request);
+
+    const expected: SandboxRawResult = {
+      exitCode: null,
+      stdout: '',
+      stderr: 'run-a workspace copy failed:\ncp: cannot create directory',
+      timedOut: false,
+      durationMs: 22,
+    };
+    expect(result.runA).toEqual(expected);
+    expect(result.runB).toEqual(expected);
+    const commands = runCalls(calls).map((call) => call.command);
+    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_B}`);
+    expect(commands.some((command) => command.includes('git apply'))).toBe(false);
+    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
+    expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
+  });
+
+  it('treats exitCode: null on a prep step as a failed step instead of continuing', async () => {
+    const sdkError: SandboxRawResult = {
+      exitCode: null,
+      stdout: '',
+      stderr: '[invalid_argument] cwd does not exist',
+      timedOut: false,
+      durationMs: 5,
+    };
+    const { factory, calls } = createFakeFactory({
+      onRun: (command) => (command === 'pip install -e . -r requirements.txt' ? sdkError : ok()),
+    });
+    const { cache } = createFakeCache();
+    const { logger } = createLogger();
+    const request = createRequest();
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    const result = await runner(request);
+
+    const expected: SandboxRawResult = {
+      exitCode: null,
+      stdout: '',
+      stderr: 'dependency installation failed:\n[invalid_argument] cwd does not exist',
+      timedOut: false,
+      durationMs: 5,
+    };
+    expect(result.runA).toEqual(expected);
+    expect(result.runB).toEqual(expected);
+    const commands = runCalls(calls).map((call) => call.command);
+    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
+    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
+  });
+
+  it('aborts both runs if pytest .venv relocation fails', async () => {
+    const relocateFailure: SandboxRawResult = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'python3: Permission denied',
+      timedOut: false,
+      durationMs: 11,
+    };
+    const { factory, calls } = createFakeFactory({
+      onRun: (command) => (command === RELOCATE_RUN_B ? relocateFailure : ok()),
+    });
+    const { cache } = createFakeCache();
+    const { logger } = createLogger();
+    const request = createRequest();
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    const result = await runner(request);
+
+    const expected: SandboxRawResult = {
+      exitCode: null,
+      stdout: '',
+      stderr: 'run-b .venv relocation failed:\npython3: Permission denied',
+      timedOut: false,
+      durationMs: 11,
+    };
+    expect(result.runA).toEqual(expected);
+    expect(result.runB).toEqual(expected);
+    const commands = runCalls(calls).map((call) => call.command);
+    expect(commands.some((command) => command.includes('git apply'))).toBe(false);
+    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
   });
 
   it('reports a test-only patch failure for Run A only, still testing Run B', async () => {
@@ -357,7 +538,7 @@ describe('createE2bDifferentialRunner', () => {
     });
     expect(result.runB).toEqual(ok());
     const tests = runCalls(calls).filter((call) => call.command === PYTEST_TEST_COMMAND);
-    expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-b']);
+    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_B]);
   });
 
   it('reports a full patch failure for Run B only, still testing Run A', async () => {
@@ -391,10 +572,10 @@ describe('createE2bDifferentialRunner', () => {
     });
     expect(result.runA).toEqual(ok());
     const tests = runCalls(calls).filter((call) => call.command === PYTEST_TEST_COMMAND);
-    expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-a']);
+    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_A]);
   });
 
-  it('runs the head install inside /run-b before the egress lockdown', async () => {
+  it('runs the head install inside run-b before the egress lockdown', async () => {
     const { factory, calls } = createFakeFactory();
     const { cache } = createFakeCache();
     const { logger } = createLogger();
@@ -419,7 +600,7 @@ describe('createE2bDifferentialRunner', () => {
     expect(headInstallIndex).toBeGreaterThan(-1);
     expect(lockdownIndex).toBeGreaterThan(headInstallIndex);
     expect(runCalls(calls).find((call) => call.command === 'npm install --include=dev')?.opts).toEqual(
-      { cwd: '/run-b', timeoutMs: 240_000 },
+      { cwd: RUN_B, timeoutMs: 240_000 },
     );
     // The network is still open for that install.
     expect(calls[lockdownIndex]).toEqual({ kind: 'network', denyAll: true });
@@ -462,7 +643,7 @@ describe('createE2bDifferentialRunner', () => {
     });
     expect(result.runA).toEqual(ok());
     const tests = runCalls(calls).filter((call) => call.command === request.testCommand);
-    expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-a']);
+    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_A]);
   });
 
   it('aborts both runs when egress lockdown is rejected', async () => {
@@ -593,7 +774,7 @@ describe('createE2bDifferentialRunner', () => {
     );
   });
 
-  it('runs jest testCommand directly without .venv PATH wrapping', async () => {
+  it('runs jest testCommand directly without .venv PATH wrapping or .venv relocation', async () => {
     const { factory, calls } = createFakeFactory();
     const { cache } = createFakeCache();
     const { logger } = createLogger();
@@ -612,7 +793,42 @@ describe('createE2bDifferentialRunner', () => {
     );
 
     const tests = runCalls(calls).filter((call) => call.command === 'npx jest tests/a.test.js');
-    expect(tests.map((call) => call.opts?.cwd)).toEqual(['/run-a', '/run-b']);
+    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_A, RUN_B]);
     expect(runCalls(calls).some((call) => call.command.includes('.venv'))).toBe(false);
+  });
+
+  it('aborts both runs when cached workspace reset extraction fails', async () => {
+    const resetFailure: SandboxRawResult = {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'tar: unexpected EOF',
+      timedOut: false,
+      durationMs: 14,
+    };
+    const { factory, calls } = createFakeFactory({
+      onRun: (command) => (command === `rm -rf ${WORKSPACE} && ${EXTRACT}` ? resetFailure : ok()),
+    });
+    const { cache } = createFakeCache({ value: 'snap-tpl' });
+    const { logger } = createLogger();
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    const result = await runner(createRequest());
+
+    const expected: SandboxRawResult = {
+      exitCode: null,
+      stdout: '',
+      stderr: 'workspace extraction failed:\ntar: unexpected EOF',
+      timedOut: false,
+      durationMs: 14,
+    };
+    expect(result.runA).toEqual(expected);
+    expect(result.runB).toEqual(expected);
+    const commands = runCalls(calls).map((call) => call.command);
+    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
+    expect(commands.some((command) => command.includes(PYTEST_TEST_COMMAND))).toBe(false);
   });
 });

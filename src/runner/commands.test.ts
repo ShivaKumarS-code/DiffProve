@@ -52,13 +52,15 @@ describe('findLockfile', () => {
 });
 
 describe('buildInstallCommand — pytest', () => {
-  it('uses uv sync when uv.lock is present', () => {
-    expect(buildInstallCommand(['pyproject.toml', 'uv.lock'], 'pytest')).toBe('uv sync');
+  it('bootstraps uv when missing and runs uv sync when uv.lock is present', () => {
+    expect(buildInstallCommand(['pyproject.toml', 'uv.lock'], 'pytest')).toBe(
+      '(command -v uv >/dev/null 2>&1 || pip install -q uv) && uv sync',
+    );
   });
 
-  it('uses poetry install with in-project virtualenv when poetry.lock is the best lockfile', () => {
+  it('bootstraps poetry when missing and runs poetry install with in-project virtualenv when poetry.lock is the best lockfile', () => {
     expect(buildInstallCommand(['poetry.lock', 'pyproject.toml'], 'pytest')).toBe(
-      'POETRY_VIRTUALENVS_IN_PROJECT=true poetry install',
+      '(command -v poetry >/dev/null 2>&1 || pip install -q poetry) && POETRY_VIRTUALENVS_IN_PROJECT=true poetry install',
     );
   });
 
@@ -80,7 +82,7 @@ describe('buildInstallCommand — pytest', () => {
 
   it('prefers uv.lock over poetry.lock and requirements.txt', () => {
     expect(buildInstallCommand(['requirements.txt', 'poetry.lock', 'uv.lock'], 'pytest')).toBe(
-      'uv sync',
+      '(command -v uv >/dev/null 2>&1 || pip install -q uv) && uv sync',
     );
   });
 
@@ -96,9 +98,9 @@ describe('buildInstallCommand — vitest / jest', () => {
     expect(buildInstallCommand(['package-lock.json'], 'jest')).toBe('npm ci');
   });
 
-  it('uses pnpm install --frozen-lockfile for pnpm-lock.yaml', () => {
+  it('uses npx --yes pnpm install --frozen-lockfile for pnpm-lock.yaml', () => {
     expect(buildInstallCommand(['pnpm-lock.yaml'], 'vitest')).toBe(
-      'pnpm install --frozen-lockfile',
+      'npx --yes pnpm install --frozen-lockfile',
     );
   });
 
