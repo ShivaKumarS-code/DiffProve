@@ -26,7 +26,7 @@ services:
     name: diffprove-api
     runtime: node
     plan: starter
-    buildCommand: npm ci && npm run build
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /healthz
     envVars:
@@ -67,7 +67,7 @@ services:
     name: diffprove-web
     runtime: node
     plan: free
-    buildCommand: npm ci && npm run build:web
+    buildCommand: npm ci --include=dev && npm run build:web
     startCommand: npm run start -w apps/web
     envVars:
       - key: NODE_ENV
