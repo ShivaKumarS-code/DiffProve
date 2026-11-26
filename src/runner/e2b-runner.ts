@@ -98,6 +98,13 @@ function testCommandForRun(request: DifferentialRunRequest): string {
     : request.testCommand;
 }
 
+/** Verifies restored snapshot dependencies exist before skipping installation. */
+function verifySnapshotDepsCommand(runnerKind: DifferentialRunRequest['runnerKind']): string {
+  return runnerKind === 'pytest'
+    ? `[ -d ${WORKSPACE}/.venv ] || PATH="${WORKSPACE}/.venv/bin:$PATH" command -v pytest >/dev/null 2>&1`
+    : `[ -d ${WORKSPACE}/node_modules ]`;
+}
+
 /**
  * Rewrites hardcoded workspace paths inside a copied `.venv` so editable
  * installs (`.pth` / `__editable__*.py`) and `.venv/bin/*` scripts resolve
@@ -154,6 +161,9 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
       await sandbox.writeFile(`${STAGING}/test-only.patch`, request.testOnlyDiff);
       await sandbox.writeFile(`${STAGING}/full.patch`, request.fullDiff);
 
+      let needsInstall = cached === null;
+      let needsSnapshot = cached === null;
+
       if (cached !== null) {
         // Snapshot HIT: workspace holds the tree of the PR that produced the
         // snapshot (stale) but its dependency environment matches this lockfile
@@ -166,29 +176,39 @@ export function createE2bDifferentialRunner(deps: E2bRunnerDeps): DifferentialRu
           return failedPrepPair('workspace extraction', reset);
         }
         await sandbox.run(`mv ${STAGING}/${depsDir} ${WORKSPACE}/${depsDir} 2>/dev/null || true`);
+
+        if (request.installCommand !== null) {
+          const depsCheck = await sandbox.run(verifySnapshotDepsCommand(request.runnerKind));
+          if (isFailedStep(depsCheck)) {
+            deps.logger.warn(
+              `cached environment snapshot for ${request.repoFullName} (${request.lockfileKey}) is missing dependencies; reinstalling`,
+            );
+            needsInstall = true;
+            needsSnapshot = true;
+          }
+        }
       } else {
         const extract = await sandbox.run(EXTRACT);
         if (isFailedStep(extract)) {
           return failedPrepPair('workspace extraction', extract);
         }
+      }
 
-        if (request.installCommand !== null) {
-          const install = await sandbox.run(request.installCommand, {
-            cwd: WORKSPACE,
-            timeoutMs: installTimeoutMs,
-          });
-          if (isFailedStep(install)) {
-            // No tests may run against an unprovisioned environment.
-            return failedPrepPair('dependency installation', install);
-          }
+      if (needsInstall && request.installCommand !== null) {
+        const install = await sandbox.run(request.installCommand, {
+          cwd: WORKSPACE,
+          timeoutMs: installTimeoutMs,
+        });
+        if (isFailedStep(install)) {
+          // No tests may run against an unprovisioned environment.
+          return failedPrepPair('dependency installation', install);
         }
       }
 
-      // Only a cold run produced a complete, reusable environment from scratch.
-      // A HIT boots from an existing snapshot and would just re-snapshot the
-      // same deps, so it is skipped. Snapshotting before cloning, patching, and
-      // running tests keeps untrusted PR code and run-a / run-b trees out of it.
-      if (cached === null && deps.snapshotCache) {
+      // Cold runs and self-healed snapshot misses capture a fresh reusable
+      // environment. Snapshotting before cloning, patching, and running tests
+      // keeps untrusted PR code and run-a / run-b trees out of it.
+      if (needsSnapshot && deps.snapshotCache) {
         const ref = await sandbox.createSnapshot(`diffprove-${request.lockfileKey}`);
         if (ref !== null) {
           try {

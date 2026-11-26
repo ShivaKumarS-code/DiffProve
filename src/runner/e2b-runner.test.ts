@@ -42,6 +42,9 @@ function relocateVenv(runDir: string): string {
 const RELOCATE_RUN_A = relocateVenv(RUN_A);
 const RELOCATE_RUN_B = relocateVenv(RUN_B);
 
+const VERIFY_NODE_DEPS = `[ -d ${WORKSPACE}/node_modules ]`;
+const VERIFY_PYTEST_DEPS = `[ -d ${WORKSPACE}/.venv ] || PATH="${WORKSPACE}/.venv/bin:$PATH" command -v pytest >/dev/null 2>&1`;
+
 const PYTEST_TEST_COMMAND = 'export PATH="$PWD/.venv/bin:$PATH"; pytest "tests/test_a.py"';
 
 const TARBALL = Uint8Array.from([31, 139, 8, 0, 1, 2, 3]);
@@ -259,6 +262,7 @@ describe('createE2bDifferentialRunner', () => {
       `run mv ${WORKSPACE}/node_modules /tmp/diffprove/node_modules 2>/dev/null || true (cwd=-, timeout=-)`,
       `run rm -rf ${WORKSPACE} && ${EXTRACT} (cwd=-, timeout=-)`,
       `run mv /tmp/diffprove/node_modules ${WORKSPACE}/node_modules 2>/dev/null || true (cwd=-, timeout=-)`,
+      `run ${VERIFY_NODE_DEPS} (cwd=-, timeout=-)`,
       `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
       `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
       `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
@@ -297,6 +301,7 @@ describe('createE2bDifferentialRunner', () => {
       `run mv ${WORKSPACE}/.venv /tmp/diffprove/.venv 2>/dev/null || true (cwd=-, timeout=-)`,
       `run rm -rf ${WORKSPACE} && ${EXTRACT} (cwd=-, timeout=-)`,
       `run mv /tmp/diffprove/.venv ${WORKSPACE}/.venv 2>/dev/null || true (cwd=-, timeout=-)`,
+      `run ${VERIFY_PYTEST_DEPS} (cwd=-, timeout=-)`,
       `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
       `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
       `run ${RELOCATE_RUN_A} (cwd=-, timeout=-)`,
@@ -830,5 +835,36 @@ describe('createE2bDifferentialRunner', () => {
     const commands = runCalls(calls).map((call) => call.command);
     expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
     expect(commands.some((command) => command.includes(PYTEST_TEST_COMMAND))).toBe(false);
+  });
+
+  it('reinstalls dependencies and refreshes the snapshot when a cached snapshot is missing deps', async () => {
+    const missingDeps: SandboxRawResult = {
+      exitCode: 1,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      durationMs: 2,
+    };
+    const { factory, calls } = createFakeFactory({
+      onRun: (command) => (command === VERIFY_PYTEST_DEPS ? missingDeps : ok()),
+    });
+    const { cache, set } = createFakeCache({ value: 'stale-empty-snap' });
+    const { logger, warn } = createLogger();
+    const request = createRequest({ lockfileKey: 'lock-py' });
+    const runner = createE2bDifferentialRunner({
+      sandboxFactory: factory,
+      snapshotCache: cache,
+      logger,
+    });
+
+    const result = await runner(request);
+
+    expect(result.runA).toEqual(ok());
+    expect(result.runB).toEqual(ok());
+    expect(warn).toHaveBeenCalledWith(
+      'cached environment snapshot for octocat/hello-world (lock-py) is missing dependencies; reinstalling',
+    );
+    expect(runCalls(calls).map((call) => call.command)).toContain(request.installCommand);
+    expect(set.mock.calls).toEqual([['octocat/hello-world', 'lock-py', 'snap-ref-1']]);
   });
 });
