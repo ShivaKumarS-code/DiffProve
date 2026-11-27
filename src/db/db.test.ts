@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createInstallationStore } from './installations.js';
 import { runMigrations } from './migrate.js';
@@ -19,6 +19,17 @@ import { createVerificationRunStore } from './verification-runs.js';
 const databaseUrl = process.env.DATABASE_URL;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const mixedEvidence: NonNullable<VerificationRunInsert['caseEvidence']> = {
+  reproducing: 1,
+  nonReproducing: 1,
+  totalCases: 3,
+  cases: [
+    { id: 'test regression', base: 'fail', head: 'pass' },
+    { id: 'test <always passes>', base: 'pass', head: 'pass' },
+    { id: 'test skipped', base: 'unknown', head: 'skipped' },
+  ],
+};
 
 /** Unique repository name per test run, so CI reruns never collide. */
 function uniqueRepoFullName(): string {
@@ -57,6 +68,36 @@ function makeRun(
     ...overrides,
   };
 }
+
+describe('Verification run JSONB decoding', () => {
+  it.each([
+    ['legacy column missing', undefined, null],
+    ['legacy SQL null', null, null],
+    ['valid mixed evidence', mixedEvidence, mixedEvidence],
+    ['JSON string instead of an object', JSON.stringify(mixedEvidence), null],
+    ['status outside the case enum', { ...mixedEvidence, cases: [{ id: 'one', base: true, head: 'pass' }] }, null],
+    ['invalid aggregate count', { ...mixedEvidence, reproducing: 1.5 }, null],
+  ])('preserves the run with %s', async (_label, stored, expected) => {
+    const query = vi.fn<() => Promise<Record<string, unknown>[]>>()
+      .mockResolvedValueOnce([{
+        id: 'run-id',
+        verdict: 'mixed-test',
+        case_evidence: stored,
+      }])
+      .mockResolvedValueOnce([{ total_runs: 1, weak_test_count: 0, mixed_test_count: 1 }]);
+    const pool: DbPool = {
+      query: async <T extends Record<string, unknown>>() => (await query()) as T[],
+      close: vi.fn<DbPool['close']>(),
+    };
+    const store = createVerificationRunStore(pool, createRepositoryStore(pool));
+
+    await expect(store.listRuns('repo-id')).resolves.toMatchObject({
+      runs: [{ id: 'run-id', verdict: 'mixed-test', caseEvidence: expected }],
+      catchRate: 0,
+      mixedTestCount: 1,
+    });
+  });
+});
 
 describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, needs DATABASE_URL)', () => {
   let pool: DbPool | undefined;
@@ -116,12 +157,15 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
   it('applies migrations once and records them in schema_migrations', async () => {
     await runMigrations(db()); // third call: still a no-op
 
-    const rows = await db().query<{ count: number }>(
-      'select count(*)::int as count from schema_migrations where name = $1',
-      ['001-init'],
+    const rows = await db().query<{ name: string; count: number }>(
+      'select name, count(*)::int as count from schema_migrations where name = any($1::text[]) group by name order by name',
+      [['001-init', '003-verification-run-case-evidence']],
     );
 
-    expect(rows).toEqual([{ count: 1 }]);
+    expect(rows).toEqual([
+      { name: '001-init', count: 1 },
+      { name: '003-verification-run-case-evidence', count: 1 },
+    ]);
   });
 
   it('upserts an installation and updates the account login on conflict', async () => {
@@ -289,13 +333,23 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
       }),
     );
 
+    await sleep(10);
+    await runs.insertRun(
+      makeRun(repository.repoFullName, {
+        prNumber: 44,
+        verdict: 'mixed-test',
+        caseEvidence: mixedEvidence,
+      }),
+    );
+
     const history = await runs.listRuns(repository.id);
 
-    expect(history.totalRuns).toBe(2);
+    expect(history.totalRuns).toBe(3);
     expect(history.weakTestCount).toBe(1);
-    expect(history.catchRate).toBe(0.5);
-    expect(history.runs).toHaveLength(2);
-    expect(history.runs[0]?.verdict).toBe('weak-test');
+    expect(history.mixedTestCount).toBe(1);
+    expect(history.catchRate).toBe(0.3333);
+    expect(history.runs).toHaveLength(3);
+    expect(history.runs[0]).toMatchObject({ verdict: 'mixed-test', caseEvidence: mixedEvidence });
 
     const verified = history.runs.find((run) => run.verdict === 'verified-fix');
     expect(verified).toBeDefined();
@@ -307,6 +361,7 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
     expect(verified?.durationMs).toBe(1_850);
     expect(verified?.runALog).toBe('Run A failed: AssertionError');
     expect(verified?.runBLog).toBe('Run B passed: 12 tests');
+    expect(verified?.caseEvidence).toBeNull();
     expect(verified?.createdAt).toBeInstanceOf(Date);
 
     const weak = history.runs.find((run) => run.verdict === 'weak-test');
@@ -315,9 +370,10 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
     // The aggregates cover the whole repository; only `runs` is paginated.
     const limited = await runs.listRuns(repository.id, 1);
     expect(limited.runs).toHaveLength(1);
-    expect(limited.totalRuns).toBe(2);
+    expect(limited.totalRuns).toBe(3);
     expect(limited.weakTestCount).toBe(1);
-    expect(limited.catchRate).toBe(0.5);
+    expect(limited.mixedTestCount).toBe(1);
+    expect(limited.catchRate).toBe(0.3333);
   });
 
   it('upserts verification runs idempotently for the same repository, PR, and SHAs', async () => {
@@ -331,10 +387,11 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
         changedTestFiles: ['tests/a.test.ts'],
         runAStatus: 'fail',
         runBStatus: 'pass',
-        verdict: 'verified-fix',
+        verdict: 'mixed-test',
         durationMs: 1_000,
         runALog: 'first A',
         runBLog: 'first B',
+        caseEvidence: mixedEvidence,
       }),
     );
 
@@ -350,12 +407,14 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
         durationMs: 2_500,
         runALog: 'retry A',
         runBLog: 'retry B',
+        caseEvidence: null,
       }),
     );
 
     const history = await runs.listRuns(repository.id);
     expect(history.totalRuns).toBe(1);
     expect(history.weakTestCount).toBe(1);
+    expect(history.mixedTestCount).toBe(0);
     expect(history.runs).toHaveLength(1);
     expect(history.runs[0]).toMatchObject({
       repositoryId: repository.id,
@@ -369,6 +428,7 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
       durationMs: 2_500,
       runALog: 'retry A',
       runBLog: 'retry B',
+      caseEvidence: null,
     });
   });
 
@@ -379,6 +439,7 @@ describe.skipIf(!process.env.DATABASE_URL)('PostgreSQL stores (integration, need
       runs: [],
       totalRuns: 0,
       weakTestCount: 0,
+      mixedTestCount: 0,
       catchRate: null,
     });
   });

@@ -22,16 +22,30 @@
  *  - `sandbox.kill(): Promise<boolean>` (11857) is the shutdown method.
  */
 
-import { CommandExitError, Sandbox } from 'e2b';
+import { lookup } from 'node:dns/promises';
+import { isIPv4 } from 'node:net';
+
+import { ALL_TRAFFIC, CommandExitError, Sandbox } from 'e2b';
 import type { SandboxNetworkUpdate, SandboxOpts } from 'e2b';
 
 import type { SandboxFactory, SandboxHandle, SandboxRawResult } from './types.js';
 
-/** Restores open egress; `allowInternetAccess` is the documented open switch. */
-const RESTORE_OPEN_EGRESS: SandboxNetworkUpdate = { allowInternetAccess: true };
+const DENY_ALL_EGRESS: SandboxNetworkUpdate = {
+  allowInternetAccess: false,
+  denyOut: [ALL_TRAFFIC],
+  dnsServers: [],
+};
 
-/** All IPv4 traffic; matches the SDK's documented "no internet" switch. */
-const DENY_ALL_EGRESS: SandboxNetworkUpdate = { denyOut: ['0.0.0.0/0'] };
+async function registryHostEntries(hosts: readonly string[]): Promise<string[]> {
+  return Promise.all(hosts.map(async (host) => {
+    if (!/^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*$/i.test(host)) {
+      throw new Error(`invalid E2B registry hostname: ${host}`);
+    }
+    const { address } = await lookup(host, { family: 4 });
+    if (!isIPv4(address)) throw new Error(`could not resolve E2B registry hostname: ${host}`);
+    return `${address} ${host}`;
+  }));
+}
 
 function isTimeoutShaped(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -96,15 +110,15 @@ class E2bSandboxHandle implements SandboxHandle {
     await this.sandbox.files.write(path, content);
   }
 
-  async updateNetworkEgress(denyAll: boolean): Promise<void> {
+  async denyNetworkEgress(): Promise<void> {
     // Errors intentionally propagate: the runner turns a failed lockdown into
     // an environment failure and refuses to execute untrusted code.
-    await this.sandbox.updateNetwork(denyAll ? DENY_ALL_EGRESS : RESTORE_OPEN_EGRESS);
+    await this.sandbox.updateNetwork(DENY_ALL_EGRESS);
   }
 
-  async createSnapshot(name: string): Promise<string | null> {
+  async createSnapshot(): Promise<string | null> {
     try {
-      const snapshot = await this.sandbox.createSnapshot({ name });
+      const snapshot = await this.sandbox.createSnapshot({ mode: 'filesystem' });
       // `SnapshotInfo.snapshotId` is the reusable reference: the SDK documents it
       // as usable with `Sandbox.create()` ("template ID with tag, or namespaced
       // name with tag", index.d.ts:10464-10474). `names` is display metadata.
@@ -130,7 +144,26 @@ class E2bSandboxHandle implements SandboxHandle {
 export function createE2bSandboxFactory(): SandboxFactory {
   return {
     async create(opts) {
-      const createOpts: SandboxOpts = {};
+      // The SDK's documented allowlist pairs allowOut with a deny for all
+      // traffic. Resolve just those hosts in the worker and configure
+      // /etc/hosts rather than allowing guest access to a public resolver.
+      const hosts = opts.network.mode === 'registries'
+        ? await registryHostEntries(opts.network.allowOut)
+        : [];
+      const createOpts: SandboxOpts =
+        opts.network.mode === 'offline'
+          ? {
+              allowInternetAccess: false,
+              network: { denyOut: [ALL_TRAFFIC], dnsServers: [], allowPublicTraffic: false },
+            }
+          : {
+              network: {
+                allowOut: [...opts.network.allowOut],
+                denyOut: [ALL_TRAFFIC],
+                dnsServers: [],
+                allowPublicTraffic: false,
+              },
+            };
       if (opts.apiKey !== undefined) {
         createOpts.apiKey = opts.apiKey;
       }
@@ -144,6 +177,20 @@ export function createE2bSandboxFactory(): SandboxFactory {
         opts.templateId === undefined
           ? await Sandbox.create(createOpts)
           : await Sandbox.create(opts.templateId, createOpts);
+      if (hosts.length > 0) {
+        try {
+          // Entries contain only validated IPv4 addresses and domain names.
+          // Clear the unreachable resolver to avoid waiting for DNS timeouts.
+          await sandbox.commands.run(`printf '%s\\n' ${hosts.map((host) => `'${host}'`).join(' ')} >> /etc/hosts && : > /etc/resolv.conf`, {
+            user: 'root',
+            shell: ['/bin/sh', '-c'],
+            timeoutMs: 15_000,
+          });
+        } catch (error) {
+          await sandbox.kill().catch(() => undefined);
+          throw error;
+        }
+      }
       return new E2bSandboxHandle(sandbox);
     },
   };

@@ -45,7 +45,6 @@ function sign(body: string, secret: string = WEBHOOK_SECRET): string {
 }
 
 const enqueue = vi.fn(async (): Promise<{ jobId: string }> => ({ jobId: 'job-1' }));
-const postQueuedCheckRun = vi.fn(async (): Promise<void> => {});
 
 /** Installation persistence double (webhook `installation` events). */
 const upsertInstallation = vi.fn(async (): Promise<void> => {});
@@ -139,7 +138,6 @@ beforeAll(() => {
   app = buildApp({
     webhookSecret: WEBHOOK_SECRET,
     enqueuer: { enqueue },
-    checkPoster: { postQueuedCheckRun },
     installations: { upsertInstallation, removeInstallation },
     // Keep test output free of per-request pino lines; the app's default level
     // is covered implicitly by buildApp's own defaulting.
@@ -149,7 +147,6 @@ beforeAll(() => {
   apiApp = buildApp({
     webhookSecret: WEBHOOK_SECRET,
     enqueuer: { enqueue },
-    checkPoster: { postQueuedCheckRun },
     api,
     logLevel: 'silent',
   });
@@ -157,7 +154,6 @@ beforeAll(() => {
 
 beforeEach(() => {
   enqueue.mockClear();
-  postQueuedCheckRun.mockClear();
   upsertInstallation.mockClear();
   removeInstallation.mockClear();
 });
@@ -168,7 +164,7 @@ afterAll(async () => {
 });
 
 describe('POST /webhooks/github', () => {
-  it('enqueues the verification job and posts the queued check run for an opened PR', async () => {
+  it('acknowledges the durable queue job for an opened PR', async () => {
     const response = await postWebhook({
       event: 'pull_request',
       signature: sign(payload),
@@ -186,13 +182,18 @@ describe('POST /webhooks/github', () => {
       baseSha: 'bbb222',
       headSha: 'aaa111',
     });
+  });
 
-    expect(postQueuedCheckRun).toHaveBeenCalledTimes(1);
-    expect(postQueuedCheckRun).toHaveBeenCalledWith({
-      repoFullName: 'octocat/hello-world',
-      headSha: 'aaa111',
-      installationId: 42,
+  it('returns a generic 500 when durable enqueue fails', async () => {
+    enqueue.mockRejectedValueOnce(new Error('private queue details'));
+    const response = await postWebhook({
+      event: 'pull_request',
+      signature: sign(payload),
+      body: payload,
     });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ message: 'failed to enqueue verification job' });
   });
 
   it('rejects a signature computed with a different secret', async () => {
@@ -205,7 +206,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(401);
     expect(response.json()).toEqual({ message: 'invalid webhook signature' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('rejects a body tampered with after signing', async () => {
@@ -222,7 +222,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(401);
     expect(response.json()).toEqual({ message: 'invalid webhook signature' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('answers a signed ping with pong', async () => {
@@ -237,7 +236,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ message: 'pong' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('ignores pull_request actions it does not verify', async () => {
@@ -252,7 +250,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ message: 'ignored pull_request closed' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('ignores deliveries without an x-github-event header', async () => {
@@ -264,7 +261,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ message: 'ignored unknown' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('acknowledges installation events without side effects', async () => {
@@ -282,7 +278,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ message: 'installation created acknowledged' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('persists the installation record for a signed installation created event', async () => {
@@ -331,7 +326,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(202);
     expect(response.json()).toEqual({ message: expect.stringContaining('job-1') });
     expect(enqueue).toHaveBeenCalledTimes(1);
-    expect(postQueuedCheckRun).toHaveBeenCalledTimes(1);
   });
 
   it('returns 400 for malformed JSON even when the signature matches the bytes', async () => {
@@ -345,7 +339,6 @@ describe('POST /webhooks/github', () => {
 
     expect(response.statusCode).toBe(400);
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 
   it('hashes the raw UTF-8 bytes of a multi-byte body', async () => {
@@ -379,7 +372,6 @@ describe('POST /webhooks/github', () => {
     expect(response.statusCode).toBe(401);
     expect(response.json()).toEqual({ message: 'invalid webhook signature' });
     expect(enqueue).not.toHaveBeenCalled();
-    expect(postQueuedCheckRun).not.toHaveBeenCalled();
   });
 });
 
@@ -678,7 +670,6 @@ describe('GitHub OAuth and per-repo authorization', () => {
     oauthApp = buildApp({
       webhookSecret: WEBHOOK_SECRET,
       enqueuer: { enqueue },
-      checkPoster: { postQueuedCheckRun },
       api,
       auth,
       logLevel: 'silent',

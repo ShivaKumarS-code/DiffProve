@@ -32,6 +32,7 @@ const VERDICT_FILTER_OPTIONS = [
   { value: 'all', label: 'All verdicts' },
   { value: 'verified-fix', label: 'Verified fix' },
   { value: 'weak-test', label: 'Weak test' },
+  { value: 'mixed-test', label: 'Mixed test evidence' },
   { value: 'broken-implementation', label: 'Broken implementation' },
   { value: 'new-symbol', label: 'New symbol' },
   { value: 'environment-failure', label: 'Environment failure' },
@@ -40,6 +41,7 @@ const VERDICT_FILTER_OPTIONS = [
 const VERDICT_LABELS: Record<string, string> = {
   'verified-fix': 'Verified fix',
   'weak-test': 'Weak test',
+  'mixed-test': 'Mixed test evidence',
   'broken-implementation': 'Broken implementation',
   'new-symbol': 'New symbol',
   'environment-failure': 'Environment failure',
@@ -77,6 +79,7 @@ function buildSpectrumTicks(runs: RunRow[]): Array<string | null> {
   }
 
   let brokenCount = 0;
+  let mixedCount = 0;
   let weakCount = 0;
   let neutralCount = 0;
   let verifiedCount = 0;
@@ -84,6 +87,8 @@ function buildSpectrumTicks(runs: RunRow[]): Array<string | null> {
   for (const run of runs) {
     if (run.verdict === 'broken-implementation') {
       brokenCount += 1;
+    } else if (run.verdict === 'mixed-test') {
+      mixedCount += 1;
     } else if (run.verdict === 'weak-test') {
       weakCount += 1;
     } else if (run.verdict === 'verified-fix') {
@@ -95,6 +100,7 @@ function buildSpectrumTicks(runs: RunRow[]): Array<string | null> {
 
   const buckets = [
     { color: '#fb7185', count: brokenCount },
+    { color: '#fb923c', count: mixedCount },
     { color: '#fbbf24', count: weakCount },
     { color: '#818cf8', count: neutralCount },
     { color: '#34d399', count: verifiedCount },
@@ -378,6 +384,9 @@ export default function RepoDetailPage() {
             <p className="mt-2 text-5xl font-light leading-none tracking-[-0.04em] tabular-nums text-white sm:text-[3.5rem]">
               {formatCatchRate(data.catchRate)}
             </p>
+            <p className="mt-2 text-[0.8125rem] text-slate-400">
+              Weak-test runs divided by all runs. Mixed runs are counted separately.
+            </p>
           </div>
 
           <dl className="space-y-2.5">
@@ -393,6 +402,14 @@ export default function RepoDetailPage() {
                 {data.weakTestCount}
               </dd>
             </div>
+            {data.mixedTestCount === null ? null : (
+              <div className="flex items-baseline justify-between gap-4">
+                <dt className="text-[0.875rem] text-slate-400">Mixed test runs</dt>
+                <dd className="text-[0.875rem] font-medium tabular-nums text-orange-200">
+                  {data.mixedTestCount}
+                </dd>
+              </div>
+            )}
             <div className="flex items-baseline justify-between gap-4">
               <dt className="text-[0.875rem] text-slate-400">Verified fixes</dt>
               <dd className="text-[0.875rem] font-medium tabular-nums text-white">
@@ -427,7 +444,7 @@ export default function RepoDetailPage() {
             <span>
               {data.runs.length === 0
                 ? 'No runs recorded yet'
-                : `Outcome distribution across ${data.totalRuns} runs`}
+                : `Outcome distribution across ${data.runs.length} recent runs`}
             </span>
             {data.runs.length === 0 ? null : (
               <span className="tabular-nums text-slate-400">{data.weakTestCount} weak caught</span>

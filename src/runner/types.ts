@@ -14,15 +14,19 @@
  *  - `src/queue/differential-handler.ts` composes everything per job.
  *
  * Scope (docs/architecture.md, "End-to-End Verification Pipeline" steps 3-5):
- * boot an ephemeral E2B sandbox from a lockfile-keyed snapshot, provision the
- * base tree without ever putting a GitHub token inside the sandbox, disable
- * outbound egress after dependency installation, and execute Run A (base +
- * Test-Only Patch) and Run B (base + Full PR Patch) with the same targeted
- * test command.
+ * provision two ephemeral E2B microVMs without putting a GitHub token
+ * inside either. Run A provisions the pinned merge base, then locks egress
+ * before applying the test-only patch. Run B uses the exact head, offline
+ * from creation. Both execute the same targeted test command.
  */
 
 /** Supported test runners (architecture guardrail #1: v1 scope). */
 export type RunnerKind = 'pytest' | 'vitest' | 'jest';
+
+export interface TestCaseResult {
+  id: string;
+  status: 'pass' | 'fail' | 'skipped' | 'unknown';
+}
 
 /**
  * Raw outcome of ONE sandbox command, as observed by the runner.
@@ -35,6 +39,8 @@ export interface SandboxRawResult {
   stderr: string;
   timedOut: boolean;
   durationMs: number;
+  /** Optional native runner report, normalized to workspace-relative test IDs. */
+  caseResults?: TestCaseResult[];
 }
 
 /** Raw outcome pair for the two differential runs. */
@@ -48,24 +54,24 @@ export interface DifferentialRunRequest {
   repoFullName: string;
   baseSha: string;
   headSha: string;
-  /** GitHub tarball of the base tree (fetched by the trusted worker; no token ever enters the sandbox). */
+  /** GitHub tarball of the pinned merge base, fetched by the trusted worker. */
   tarball: Uint8Array;
+  /** GitHub tarball of the exact PR head, fetched by the trusted worker. */
+  headTarball: Uint8Array;
   /** Test-Only Patch (applied for Run A). */
   testOnlyDiff: string;
-  /** Full PR Patch (applied for Run B). */
-  fullDiff: string;
   /** Targeted test command, e.g. `pytest "tests/test_a.py"`. */
   testCommand: string;
   /** Dependency install command for the BASE lockfile; null = skip install. */
   installCommand: string | null;
-  /**
-   * Dependency install command for Run B's HEAD state. Null when the head
-   * lockfile hash equals the base hash (Run B reuses the installed deps).
-   */
+  /** Head dependency install command, run offline even when lockfile hashes match; null = skip. */
   headInstallCommand: string | null;
   runnerKind: RunnerKind;
-  /** Lockfile hash key ('none' when no lockfile) used for snapshot caching. */
+  /** Base lockfile hash ('none' when no lockfile), one part of the snapshot cache key. */
   lockfileKey: string;
+  headLockfileKey: string;
+  /** Only set for the standard, worker-built command for this runner kind. */
+  collectCaseResults?: boolean;
 }
 
 /**
@@ -102,6 +108,7 @@ export interface SandboxRunOutcome {
 export type Verdict =
   | 'verified-fix'
   | 'weak-test'
+  | 'mixed-test'
   | 'broken-implementation'
   | 'new-symbol'
   | 'environment-failure';
@@ -120,32 +127,36 @@ export interface SandboxHandle {
   /** Writes a text or binary file into the sandbox, creating directories as needed. */
   writeFile(path: string, content: string | Uint8Array): Promise<void>;
   /**
-   * Locks down (or restores) outbound network egress for the running
-   * sandbox. Throws when the platform rejects the change.
+   * Denies all outbound network egress for the running sandbox. There is
+   * deliberately no way to reopen egress through this handle.
    */
-  updateNetworkEgress(denyAll: boolean): Promise<void>;
+  denyNetworkEgress(): Promise<void>;
   /**
-   * Creates a snapshot of the running sandbox; resolves to the snapshot's
-   * reusable reference (id/template), or null when snapshotting is
-   * unavailable — never throws.
+   * Creates a filesystem-only snapshot (no running processes are captured).
+   * Resolves to its reusable reference, or null when unavailable — never throws.
    */
-  createSnapshot(name: string): Promise<string | null>;
+  createSnapshot(): Promise<string | null>;
   close(): Promise<void>;
 }
 
 /** Creates sandboxes; the E2B adapter is the only real implementation. */
 export interface SandboxFactory {
-  create(opts: { templateId?: string; apiKey?: string; timeoutMs?: number }): Promise<SandboxHandle>;
+  create(opts: {
+    templateId?: string;
+    apiKey?: string;
+    timeoutMs?: number;
+    network: { mode: 'offline' } | { mode: 'registries'; allowOut: readonly string[] };
+  }): Promise<SandboxHandle>;
 }
 
 /**
- * Port: lockfile-keyed environment snapshot metadata (Redis in production,
+ * Port: versioned baseline snapshot metadata (Redis in production,
  * `src/runner/snapshot-cache.ts`; fakes in tests). Values are reusable
  * snapshot/template references for `SandboxFactory.create`.
  */
 export interface EnvSnapshotCache {
-  get(repoFullName: string, lockfileKey: string): Promise<string | null>;
-  set(repoFullName: string, lockfileKey: string, templateRef: string): Promise<void>;
+  get(repoFullName: string, snapshotKey: string): Promise<string | null>;
+  set(repoFullName: string, snapshotKey: string, templateRef: string): Promise<void>;
 }
 
 /** Input for reading one text file (manifest/lockfile) from a repo at a ref. */
@@ -191,6 +202,7 @@ export interface VerdictReportInput {
   headSha: string;
   installationId: number;
   prNumber: number;
+  checkRunId?: number;
   verdict: Verdict;
   /** GitHub check run conclusion: success | failure | neutral (matrix column 4). */
   conclusion: 'success' | 'failure' | 'neutral';

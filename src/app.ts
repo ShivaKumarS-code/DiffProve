@@ -17,7 +17,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { registerAuthRoutes, type AuthDeps } from './api/auth-routes.js';
 import { registerApiRoutes, type ApiDeps } from './api/routes.js';
 import type { InstallationStore } from './db/types.js';
-import type { CheckRunPoster, Enqueuer } from './domain.js';
+import type { Enqueuer } from './domain.js';
 import { parseWebhookEvent } from './webhooks/events.js';
 import { handleWebhookEvent } from './webhooks/handle-event.js';
 import { verifyWebhookSignature } from './webhooks/verify-signature.js';
@@ -37,7 +37,6 @@ declare module 'fastify' {
 export interface AppDeps {
   webhookSecret: string;
   enqueuer: Enqueuer;
-  checkPoster: CheckRunPoster;
   /**
    * Dashboard API stores (`GET /api/repos`, `GET /api/repos/:id/runs`,
    * `PATCH /api/repos/:id/config`). Omitted or null when `DATABASE_URL` is not
@@ -137,7 +136,6 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     try {
       const result = await handleWebhookEvent(parsed, {
         enqueuer: deps.enqueuer,
-        checkPoster: deps.checkPoster,
         installations: deps.installations ?? null,
         logger: app.log,
       });

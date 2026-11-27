@@ -1,98 +1,155 @@
 import type { Octokit } from '@octokit/core';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { CheckRunInput } from '../domain.js';
-import { CHECK_RUN_NAME, createCheckRunPoster } from './checks.js';
+import { type VerificationJob, verificationKey } from '../domain.js';
+import { CHECK_RUN_NAME, createVerificationChecks } from './checks.js';
 
-const QUEUED_INPUT: CheckRunInput = {
+const JOB: VerificationJob = {
   repoFullName: 'octocat/hello-world',
   headSha: 'abc123def',
+  baseSha: 'bbb222',
+  prNumber: 7,
   installationId: 42,
 };
 
-/** Builds the poster with a fake transport and a fake token source. */
-function buildPoster(): {
-  poster: ReturnType<typeof createCheckRunPoster>;
-  request: ReturnType<typeof vi.fn>;
-  installation: ReturnType<typeof vi.fn>;
-} {
-  const request = vi.fn();
-  const installation = vi.fn().mockResolvedValue({ token: 'ghs_x' });
-  const octokit = { request } as unknown as Octokit;
-  const poster = createCheckRunPoster(octokit, { installation });
+const LIST = 'GET /repos/{owner}/{repo}/commits/{ref}/check-runs';
+const CREATE = 'POST /repos/{owner}/{repo}/check-runs';
+const GET = 'GET /repos/{owner}/{repo}/check-runs/{check_run_id}';
+const PATCH = 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}';
+const EXTERNAL_ID = verificationKey(JOB);
+const SAME_IDENTITY = { name: CHECK_RUN_NAME, external_id: EXTERNAL_ID, app: { id: 13 } };
+const SCOPE = {
+  owner: 'octocat',
+  repo: 'hello-world',
+  headers: { authorization: 'token ghs_x' },
+};
 
-  return { poster, request, installation };
+function listed(checkRuns: unknown[] = [], link?: string) {
+  return { data: { check_runs: checkRuns }, headers: { link } };
 }
 
-describe('createCheckRunPoster', () => {
-  it('posts a queued check run on the PR head sha using an installation token', async () => {
-    const { poster, request, installation } = buildPoster();
+function setup() {
+  const request = vi.fn();
+  const installation = vi.fn().mockResolvedValue({ token: 'ghs_x' });
+  const checks = createVerificationChecks({ request } as unknown as Octokit, { installation }, 13);
+  return { checks, request, installation };
+}
 
-    await expect(poster.postQueuedCheckRun(QUEUED_INPUT)).resolves.toBeUndefined();
+describe('createVerificationChecks', () => {
+  it('creates a queued check on the pinned head with a stable external ID', async () => {
+    const { checks, request, installation } = setup();
+    request.mockResolvedValueOnce(listed()).mockResolvedValueOnce({ data: { id: 77 } });
 
-    expect(installation).toHaveBeenCalledTimes(1);
-    expect(installation).toHaveBeenCalledWith(42);
+    await expect(checks.ensureQueuedCheckRun(JOB)).resolves.toBe(77);
 
-    expect(request).toHaveBeenCalledTimes(1);
-    const [route, parameters] = request.mock.calls[0] as [
-      string,
-      Record<string, unknown>,
-    ];
-
-    expect(route).toBe('POST /repos/{owner}/{repo}/check-runs');
-    expect(parameters).toMatchObject({
-      owner: 'octocat',
-      repo: 'hello-world',
-      name: CHECK_RUN_NAME,
-      head_sha: 'abc123def',
-      status: 'queued',
+    expect(installation).toHaveBeenCalledExactlyOnceWith(42);
+    expect(request).toHaveBeenNthCalledWith(1, LIST, {
+      ...SCOPE,
+      app_id: 13,
+      ref: JOB.headSha,
+      filter: 'all',
+      page: 1,
+      per_page: 100,
     });
-    expect(parameters.headers).toEqual({ authorization: 'token ghs_x' });
+    expect(request).toHaveBeenNthCalledWith(2, CREATE, {
+      ...SCOPE,
+      name: CHECK_RUN_NAME,
+      head_sha: JOB.headSha,
+      status: 'queued',
+      external_id: EXTERNAL_ID,
+    });
   });
 
-  it('rejects a malformed repoFullName without calling GitHub', async () => {
-    const { poster, request, installation } = buildPoster();
+  it('recovers only a matching App and external ID, across pages and regardless of status', async () => {
+    const { checks, request } = setup();
+    request
+      .mockResolvedValueOnce(listed([
+        { id: 1, name: CHECK_RUN_NAME, app: { id: 13 }, external_id: null },
+        { id: 2, name: CHECK_RUN_NAME, app: { id: 13 }, external_id: verificationKey({ ...JOB, prNumber: 9 }) },
+        { id: 3, ...SAME_IDENTITY, app: { id: 99 } },
+      ], '<https://api.github.com/page?page=2>; rel="next"'))
+      .mockResolvedValueOnce(listed([{ id: 77, ...SAME_IDENTITY, status: 'completed' }]));
 
-    await expect(
-      poster.postQueuedCheckRun({ ...QUEUED_INPUT, repoFullName: 'no-slash' }),
-    ).rejects.toThrow(/invalid repoFullName: no-slash/);
+    await expect(checks.ensureQueuedCheckRun(JOB)).resolves.toBe(77);
 
-    expect(request).not.toHaveBeenCalled();
-    expect(installation).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenLastCalledWith(LIST, expect.objectContaining({ page: 2, filter: 'all' }));
   });
 
-  it('refuses to post a check run without installation context', async () => {
-    const { poster, request, installation } = buildPoster();
+  it('recovers a check when GitHub created it but the POST response was lost', async () => {
+    const { checks, request } = setup();
+    request
+      .mockResolvedValueOnce(listed())
+      .mockRejectedValueOnce(new Error('connection closed'))
+      .mockResolvedValueOnce(listed([{ id: 77, ...SAME_IDENTITY }]));
 
-    await expect(
-      poster.postQueuedCheckRun({ ...QUEUED_INPUT, installationId: null }),
-    ).rejects.toThrow(/installation context/);
-
-    expect(request).not.toHaveBeenCalled();
-    expect(installation).not.toHaveBeenCalled();
+    await expect(checks.ensureQueuedCheckRun(JOB)).rejects.toThrow('ensure queued check run');
+    await expect(checks.ensureQueuedCheckRun(JOB)).resolves.toBe(77);
+    expect(request.mock.calls.map(([route]) => route)).toEqual([LIST, CREATE, LIST]);
   });
 
-  it('rethrows request failures with the HTTP status and repo, without the token', async () => {
-    const { poster, request } = buildPoster();
-    request.mockRejectedValue(
-      Object.assign(new Error('Request failed with status code 403'), {
-        status: 403,
-        response: { status: 403, headers: {}, data: { message: 'Forbidden' } },
-      }),
-    );
+  it('looks up and completes the exact check after exhaustion when the ID was not persisted', async () => {
+    const { checks, request } = setup();
+    request.mockResolvedValueOnce(listed([{ id: 77, ...SAME_IDENTITY }]))
+      .mockResolvedValueOnce({ data: { status: 'queued' } })
+      .mockResolvedValueOnce({});
 
-    let thrown: unknown;
-    try {
-      await poster.postQueuedCheckRun(QUEUED_INPUT);
-    } catch (error) {
-      thrown = error;
-    }
+    await checks.reportExhaustedFailure(JOB);
 
-    expect(thrown).toBeInstanceOf(Error);
-    const message = (thrown as Error).message;
-    expect(message).toContain('403');
-    expect(message).toContain('hello-world');
-    expect(message).toContain('abc123def');
-    expect(message).not.toContain('ghs_x');
+    expect(request).toHaveBeenNthCalledWith(2, GET, { ...SCOPE, check_run_id: 77 });
+    expect(request).toHaveBeenNthCalledWith(3, PATCH, {
+      ...SCOPE,
+      check_run_id: 77,
+      status: 'completed',
+      conclusion: 'neutral',
+      output: {
+        title: 'Differential verification could not complete',
+        summary: 'DiffProve could not finish verification after retries. No test verdict is available.',
+      },
+    });
+  });
+
+  it('creates a completed neutral check directly if no check was ever created', async () => {
+    const { checks, request } = setup();
+    request.mockResolvedValueOnce(listed()).mockResolvedValueOnce({});
+
+    await checks.reportExhaustedFailure(JOB);
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenLastCalledWith(CREATE, expect.objectContaining({
+      head_sha: JOB.headSha,
+      external_id: EXTERNAL_ID,
+      status: 'completed',
+      conclusion: 'neutral',
+    }));
+  });
+
+  it('does not overwrite a completed verdict after the history write fails', async () => {
+    const { checks, request } = setup();
+    request.mockResolvedValueOnce({ data: { status: 'completed', conclusion: 'success' } });
+
+    await checks.reportExhaustedFailure({ ...JOB, checkRunId: 77 });
+
+    expect(request).toHaveBeenCalledExactlyOnceWith(GET, { ...SCOPE, check_run_id: 77 });
+  });
+
+  it('does not guess whether a persisted check is complete if the exact GET fails', async () => {
+    const { checks, request } = setup();
+    request.mockRejectedValueOnce(Object.assign(new Error('private request details'), { status: 503 }));
+
+    await expect(checks.reportExhaustedFailure({ ...JOB, checkRunId: 77 }))
+      .rejects.toThrow('failed to report exhausted verification for octocat/hello-world at abc123def with HTTP 503');
+
+    expect(request).toHaveBeenCalledExactlyOnceWith(GET, { ...SCOPE, check_run_id: 77 });
+  });
+
+  it('does not expose GitHub request details or create on lookup failure', async () => {
+    const { checks, request } = setup();
+    request.mockRejectedValueOnce(Object.assign(new Error('token ghs_x'), { status: 403 }));
+
+    const failure = checks.ensureQueuedCheckRun(JOB);
+    await expect(failure).rejects.toThrow('failed to ensure queued check run for octocat/hello-world at abc123def with HTTP 403');
+    await expect(failure).rejects.not.toHaveProperty('cause');
+    expect(request).toHaveBeenCalledTimes(1);
   });
 });

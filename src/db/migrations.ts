@@ -91,4 +91,10 @@ export const MIGRATIONS: readonly { name: string; sql: string }[] = [
         on verification_runs (repository_id, pr_number, base_sha, head_sha);
     `,
   },
+  {
+    name: '003-verification-run-case-evidence',
+    sql: `
+      alter table verification_runs add column if not exists case_evidence jsonb;
+    `,
+  },
 ];

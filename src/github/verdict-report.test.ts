@@ -1,23 +1,8 @@
 import type { Octokit } from '@octokit/core';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { SandboxRunOutcome, VerdictReportInput } from '../runner/types.js';
-import { CHECK_RUN_NAME } from './checks.js';
+import type { VerdictReportInput } from '../runner/types.js';
 import { createVerdictReporter } from './verdict-report.js';
-
-const RUN_A: SandboxRunOutcome = {
-  status: 'fail',
-  exitCode: 1,
-  durationMs: 400,
-  logExcerpt: 'FAILED tests/test_total.py::test_total - AssertionError: 3 != 4',
-};
-
-const RUN_B: SandboxRunOutcome = {
-  status: 'pass',
-  exitCode: 0,
-  durationMs: 800,
-  logExcerpt: '1 passed in 0.42s',
-};
 
 const REPORT: VerdictReportInput = {
   repoFullName: 'octocat/hello-world',
@@ -27,202 +12,78 @@ const REPORT: VerdictReportInput = {
   verdict: 'verified-fix',
   conclusion: 'success',
   title: 'Differential verification passed',
-  summary:
-    '**Verified fix** — Run A failed on the base commit as expected and Run B passes on head.\n\n' +
-    '| Run A (base + new tests) | Run B (head + new tests) | Verdict |',
-  runA: RUN_A,
-  runB: RUN_B,
+  summary: '**Verified fix** — Run A failed on base as expected and Run B passes on head.',
+  runA: { status: 'fail', exitCode: 1, durationMs: 400, logExcerpt: 'AssertionError: 3 != 4' },
+  runB: { status: 'pass', exitCode: 0, durationMs: 800, logExcerpt: '1 passed in 0.42s' },
   durationMs: 1234,
 };
+const GET = 'GET /repos/{owner}/{repo}/check-runs/{check_run_id}';
+const PATCH = 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}';
 
-const LIST_ROUTE = 'GET /repos/{owner}/{repo}/commits/{ref}/check-runs';
-const PATCH_ROUTE = 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}';
-const CREATE_ROUTE = 'POST /repos/{owner}/{repo}/check-runs';
-
-/** Builds the reporter with a fake transport and a fake token source. */
-function buildReporter(): {
-  reporter: ReturnType<typeof createVerdictReporter>;
-  request: ReturnType<typeof vi.fn>;
-  installation: ReturnType<typeof vi.fn>;
-} {
+function setup() {
   const request = vi.fn();
   const installation = vi.fn().mockResolvedValue({ token: 'ghs_x' });
-  const octokit = { request } as unknown as Octokit;
-  const reporter = createVerdictReporter(octokit, { installation });
-
+  const reporter = createVerdictReporter({ request } as unknown as Octokit, { installation });
   return { reporter, request, installation };
 }
 
-/** Reads one recorded `octokit.request` call as `[route, parameters]`. */
-function callAt(
-  request: ReturnType<typeof vi.fn>,
-  index: number,
-): [string, Record<string, unknown>] {
-  return request.mock.calls[index] as [string, Record<string, unknown>];
-}
-
-/** Builds an Octokit `RequestError`-shaped rejection carrying an HTTP status. */
-function requestError(status: number, message: string): Error {
-  return Object.assign(new Error(message), {
-    status,
-    response: { status, headers: {}, data: { message } },
-  });
-}
-
-/** Captures the message of the error a call rejects with. */
-async function messageOf(promise: Promise<unknown>): Promise<string> {
-  try {
-    await promise;
-  } catch (error) {
-    expect(error).toBeInstanceOf(Error);
-    return (error as Error).message;
-  }
-
-  throw new Error('expected the call to reject');
-}
-
 describe('createVerdictReporter', () => {
-  it('completes the existing DiffProve check run with the verdict', async () => {
-    const { reporter, request, installation } = buildReporter();
-    request
-      .mockResolvedValueOnce({
-        status: 200,
-        data: {
-          total_count: 2,
-          check_runs: [
-            { id: 1, name: 'Other CI' },
-            { id: 77, name: CHECK_RUN_NAME },
-          ],
-        },
-      })
-      .mockResolvedValueOnce({ status: 200, data: {} });
+  it('completes the worker check with the rendered verdict', async () => {
+    const { reporter, request, installation } = setup();
+    request.mockResolvedValueOnce({ data: { status: 'queued' } });
 
-    await expect(reporter.reportVerdict(REPORT)).resolves.toBeUndefined();
+    await reporter.reportVerdict({ ...REPORT, checkRunId: 77 });
 
-    expect(installation).toHaveBeenCalledTimes(1);
-    expect(installation).toHaveBeenCalledWith(42);
+    expect(installation).toHaveBeenCalledExactlyOnceWith(42);
     expect(request).toHaveBeenCalledTimes(2);
-
-    const [listRoute, listParameters] = callAt(request, 0);
-    expect(listRoute).toBe(LIST_ROUTE);
-    expect(listParameters).toMatchObject({
+    expect(request).toHaveBeenNthCalledWith(1, GET, {
       owner: 'octocat',
       repo: 'hello-world',
-      ref: 'head456',
+      check_run_id: 77,
       headers: { authorization: 'token ghs_x' },
     });
-
-    const [patchRoute, patchParameters] = callAt(request, 1);
-    expect(patchRoute).toBe(PATCH_ROUTE);
-    expect(patchParameters).toMatchObject({
+    expect(request).toHaveBeenNthCalledWith(2, PATCH, {
       owner: 'octocat',
       repo: 'hello-world',
       check_run_id: 77,
       status: 'completed',
       conclusion: 'success',
+      output: { title: REPORT.title, summary: REPORT.summary },
       headers: { authorization: 'token ghs_x' },
     });
-    // Report fields flow through untouched ("API & Interface Contracts").
-    expect(patchParameters.output).toEqual({
-      title: REPORT.title,
-      summary: REPORT.summary,
-    });
   });
 
-  it('POSTs a completed run when the head commit has no DiffProve check run', async () => {
-    const { reporter, request, installation } = buildReporter();
-    request
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { total_count: 1, check_runs: [{ id: 1, name: 'Other CI' }] },
-      })
-      .mockResolvedValueOnce({ status: 201, data: {} });
+  it('does not make an ambiguous write when no worker check ID was supplied', async () => {
+    const { reporter, request, installation } = setup();
 
-    await expect(reporter.reportVerdict(REPORT)).resolves.toBeUndefined();
+    await expect(reporter.reportVerdict(REPORT)).rejects.toThrow('without the worker check run ID');
 
-    expect(installation).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledTimes(2);
-
-    const routes = request.mock.calls.map((call) => (call as [string])[0]);
-    expect(routes).toEqual([LIST_ROUTE, CREATE_ROUTE]);
-    expect(routes).not.toContain(PATCH_ROUTE);
-
-    const [createRoute, createParameters] = callAt(request, 1);
-    expect(createRoute).toBe(CREATE_ROUTE);
-    expect(createParameters).toMatchObject({
-      owner: 'octocat',
-      repo: 'hello-world',
-      name: CHECK_RUN_NAME,
-      head_sha: 'head456',
-      status: 'completed',
-      conclusion: 'success',
-      headers: { authorization: 'token ghs_x' },
-    });
-    expect(createParameters.output).toEqual({
-      title: REPORT.title,
-      summary: REPORT.summary,
-    });
-  });
-
-  it('POSTs a completed run when the head commit has no check runs at all', async () => {
-    const { reporter, request } = buildReporter();
-    request
-      .mockResolvedValueOnce({ status: 200, data: { total_count: 0, check_runs: [] } })
-      .mockResolvedValueOnce({ status: 201, data: {} });
-
-    await expect(reporter.reportVerdict(REPORT)).resolves.toBeUndefined();
-
-    expect(request).toHaveBeenCalledTimes(2);
-    const [createRoute, createParameters] = callAt(request, 1);
-    expect(createRoute).toBe(CREATE_ROUTE);
-    expect(createParameters).toMatchObject({
-      name: CHECK_RUN_NAME,
-      head_sha: 'head456',
-      status: 'completed',
-      conclusion: 'success',
-    });
-  });
-
-  it('rejects a malformed repoFullName without calling GitHub', async () => {
-    const { reporter, request, installation } = buildReporter();
-
-    await expect(
-      reporter.reportVerdict({ ...REPORT, repoFullName: 'no-slash' }),
-    ).rejects.toThrow(/invalid repoFullName: no-slash/);
-
-    expect(request).not.toHaveBeenCalled();
     expect(installation).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it('rethrows check-run lookup failures with the HTTP status, repo and sha, without the token', async () => {
-    const { reporter, request } = buildReporter();
-    request.mockRejectedValue(requestError(403, 'Forbidden'));
-
-    const message = await messageOf(reporter.reportVerdict(REPORT));
-
-    expect(message).toContain('403');
-    expect(message).toContain('hello-world');
-    expect(message).toContain('head456');
-    expect(message).toContain('verified-fix');
-    expect(message).not.toContain('ghs_x');
-    // A failed lookup must not fall through to creating a run.
-    expect(request).toHaveBeenCalledTimes(1);
-  });
-
-  it('rethrows check-run update failures without falling back to a second write', async () => {
-    const { reporter, request } = buildReporter();
+  it('sanitizes failed PATCH requests and does not fall back to a second write', async () => {
+    const { reporter, request } = setup();
     request
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { total_count: 1, check_runs: [{ id: 77, name: CHECK_RUN_NAME }] },
-      })
-      .mockRejectedValueOnce(requestError(500, 'Server Error'));
+      .mockResolvedValueOnce({ data: { status: 'queued' } })
+      .mockRejectedValueOnce(Object.assign(new Error('token ghs_x'), { status: 503 }));
 
-    const message = await messageOf(reporter.reportVerdict(REPORT));
+    const failure = reporter.reportVerdict({ ...REPORT, checkRunId: 77 });
+    await expect(failure).rejects.toThrow('failed to report verified-fix verdict for octocat/hello-world at head456 with HTTP 503');
+    await expect(failure).rejects.not.toHaveProperty('cause');
+    expect(request.mock.calls.map(([route]) => route)).toEqual([GET, PATCH]);
+  });
 
-    expect(message).toContain('500');
-    expect(message).toContain('head456');
-    expect(message).not.toContain('ghs_x');
-    expect(request).toHaveBeenCalledTimes(2);
+  it('preserves the original verdict if an ambiguous PATCH succeeded and the retry reaches a different result', async () => {
+    const { reporter, request } = setup();
+    request
+      .mockResolvedValueOnce({ data: { status: 'queued' } })
+      .mockRejectedValueOnce(new Error('lost PATCH response'))
+      .mockResolvedValueOnce({ data: { status: 'completed', conclusion: 'success' } });
+
+    await expect(reporter.reportVerdict({ ...REPORT, checkRunId: 77 })).rejects.toThrow('failed to report');
+    await reporter.reportVerdict({ ...REPORT, checkRunId: 77, verdict: 'weak-test', conclusion: 'failure' });
+
+    expect(request.mock.calls.map(([route]) => route)).toEqual([GET, PATCH, GET]);
   });
 });

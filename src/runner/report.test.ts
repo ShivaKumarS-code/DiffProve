@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { summarizeCaseEvidence, type CaseEvidence } from './case-evidence.js';
 import { buildVerdictReport } from './report.js';
 import type { RunStatus, SandboxRunOutcome, Verdict } from './types.js';
 
@@ -40,6 +41,7 @@ function detailsBlock(logExcerpt: string): string {
 
 const TITLES: ReadonlyArray<readonly [Verdict, string]> = [
   ['verified-fix', 'Differential verification passed'],
+  ['mixed-test', 'Mixed reproducing and non-reproducing tests'],
   ['weak-test', 'Weak or non-reproducing test detected'],
   ['broken-implementation', 'Implementation fails its own tests'],
   ['new-symbol', 'New feature test (base import/syntax error)'],
@@ -49,13 +51,17 @@ const TITLES: ReadonlyArray<readonly [Verdict, string]> = [
 const LEADS: ReadonlyArray<readonly [Verdict, string]> = [
   [
     'verified-fix',
-    '**Verified fix** — Run A failed on the base commit as expected and Run B passes on head. The new tests genuinely reproduce the PR change.',
+    '**Verified fix** — the targeted run failed on base and passed on head. The aggregate result does not verify every test case independently.',
+  ],
+  [
+    'mixed-test',
+    '**Mixed test evidence** — some cases failed on base and passed on head, while others passed on both.',
   ],
   [
     'weak-test',
-    '**Weak or non-reproducing test** — the new tests pass on the base commit too, so they do not verify the PR change.',
+    '**Weak or non-reproducing test** — the targeted run passed on both base and head, so it did not demonstrate a failure on base.',
   ],
-  ['broken-implementation', '**Broken implementation** — the PR still fails its own new tests on head.'],
+  ['broken-implementation', '**Broken implementation** — the targeted run still fails on head.'],
   [
     'new-symbol',
     '**New feature test** — Run A fails with an import or syntax error, which is expected when a PR introduces a new symbol, and Run B passes. Annotated as neutral rather than a failure.',
@@ -68,6 +74,7 @@ const LEADS: ReadonlyArray<readonly [Verdict, string]> = [
 
 const MATRIX_ROWS: ReadonlyArray<readonly [Verdict, RunStatus, RunStatus, string]> = [
   ['verified-fix', 'fail', 'pass', 'Verified fix'],
+  ['mixed-test', 'fail', 'pass', 'Mixed test evidence'],
   ['weak-test', 'pass', 'pass', 'Weak / non-reproducing test'],
   ['broken-implementation', 'fail', 'fail', 'Broken implementation'],
   ['new-symbol', 'import-error', 'pass', 'New feature test'],
@@ -125,6 +132,105 @@ describe('buildVerdictReport — matrix table', () => {
     const { summary } = buildVerdictReport('verified-fix', outcome('fail'), outcome('pass'), CONTEXT);
 
     expect(summary).toContain('| fail | pass | Verified fix |');
+  });
+});
+
+describe('buildVerdictReport — test case evidence', () => {
+  it('distinguishes unavailable evidence from a legacy report', () => {
+    const a = outcome('fail');
+    const b = outcome('pass');
+    const old = buildVerdictReport('verified-fix', a, b, CONTEXT);
+    expect(old.summary).not.toContain('### Test case evidence');
+    expect(old.summary).toContain('aggregate result does not verify every test case independently');
+
+    const attempted = buildVerdictReport('verified-fix', a, b, { ...CONTEXT, caseEvidence: null });
+    expect(attempted.summary).toContain('Individual test case evidence is unavailable');
+    expect(attempted.summary).not.toContain('| Test case | Base | Head |');
+  });
+
+  it('includes both transition counts and renders unknown/skipped states', () => {
+    const caseEvidence: CaseEvidence = {
+      reproducing: 1,
+      nonReproducing: 1,
+      totalCases: 3,
+      cases: [
+        { id: 'undetermined test', base: 'skipped', head: 'unknown' },
+        { id: 'fixed test', base: 'fail', head: 'pass' },
+        { id: 'weak test', base: 'pass', head: 'pass' },
+      ],
+    };
+    const { summary } = buildVerdictReport('mixed-test', outcome('fail'), outcome('pass'), {
+      ...CONTEXT,
+      caseEvidence,
+    });
+    expect(summary).toContain('Reproducing (fail → pass): **1**');
+    expect(summary).toContain('Non-reproducing (pass → pass): **1**');
+    expect(summary).toContain('Total case identities: **3**');
+    expect(summary).toContain('all tests run in the targeted test files, not just cases edited by the PR');
+    expect(summary).toContain('| fixed test | fail | pass |');
+    expect(summary).toContain('| weak test | pass | pass |');
+    expect(summary).toContain('| undetermined test | skipped | unknown |');
+    expect(summary.indexOf('| undetermined test')).toBeLessThan(summary.indexOf('| fixed test'));
+  });
+
+  it.each(['pass', 'fail'] as const)('keeps both transitions at the Markdown cap with 25 base %s cases', (majority) => {
+    const minority = majority === 'pass' ? 'fail' : 'pass';
+    const base = [
+      { id: 'a skipped', status: 'skipped' as const },
+      { id: 'b unknown', status: 'unknown' as const },
+      ...Array.from({ length: 25 }, (_, index) => ({
+        id: `common case ${String(index).padStart(2, '0')}`,
+        status: majority,
+      })),
+      { id: 'z rare case', status: minority } as const,
+    ];
+    const head = base.map(({ id }) => ({ id, status: 'pass' as const }));
+    const caseEvidence = summarizeCaseEvidence(base, head);
+    expect(caseEvidence?.cases).toHaveLength(28);
+    const { summary } = buildVerdictReport('mixed-test', outcome('fail'), outcome('pass'), {
+      ...CONTEXT,
+      caseEvidence,
+    });
+    const detailRows = summary.split('\n').filter((line) => /^\| (?:common case|z rare case) /.test(line));
+    expect(detailRows).toHaveLength(20);
+    expect(detailRows[0]).toBe(`| common case 00 | ${majority} | pass |`);
+    expect(detailRows.at(-1)).toBe(`| z rare case | ${minority} | pass |`);
+    expect(summary).not.toContain('| a skipped |');
+    expect(summary).not.toContain('| b unknown |');
+    expect(summary).toContain('_Showing 20 of 28 case identities._');
+  });
+
+  it('escapes hostile identifiers and clips the table more tightly than stored evidence', () => {
+    const hostile = '`|<script>&\\\n@owner \u202E[click](https://evil.example) ';
+    const caseEvidence: CaseEvidence = {
+      reproducing: 5,
+      nonReproducing: 65,
+      totalCases: 120,
+      cases: [
+        { id: `${hostile}${'✌'.repeat(512)}DO_NOT_SHOW`, base: 'pass', head: 'pass' },
+        ...Array.from({ length: 99 }, (_, i) => ({
+          id: `case ${i + 2} ${'|'.repeat(512)}`,
+          base: 'fail' as const,
+          head: 'pass' as const,
+        })),
+      ],
+    };
+    const { summary } = buildVerdictReport(
+      'mixed-test',
+      outcome('fail', { logExcerpt: '🌊'.repeat(2000) }),
+      outcome('pass', { logExcerpt: '🌊'.repeat(2000) }),
+      { ...CONTEXT, caseEvidence },
+    );
+    expect(summary).toContain('&#96;&#124;&#60;script&#62;&#38;&#92; &#64;owner');
+    expect(summary).not.toContain('<script>');
+    expect(summary).not.toContain('@owner');
+    expect(summary).not.toContain('https://evil.example');
+    expect(summary).not.toContain('\u202E');
+    expect(summary).not.toContain('DO_NOT_SHOW');
+    expect(summary).not.toContain('| case 21 ');
+    expect(summary).toContain('_Showing 20 of 120 case identities._');
+    expect(summary).toContain('Total case identities: **120**');
+    expect(Buffer.byteLength(summary)).toBeLessThan(65_535);
   });
 });
 

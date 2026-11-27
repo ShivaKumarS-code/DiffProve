@@ -12,6 +12,7 @@
  * degrades to readable text, never to a thrown error or a broken code fence.
  */
 
+import { selectCaseDetails, type CaseEvidence } from './case-evidence.js';
 import type { SandboxRunOutcome, Verdict } from './types.js';
 
 /** Values the report needs that are not part of the Run A / Run B outcomes. */
@@ -20,6 +21,8 @@ export interface VerdictReportContext {
   prNumber: number;
   /** Total wall-clock time of both runs, reported in the footer. */
   durationMs: number;
+  /** Omitted by legacy callers; null means case evidence was unavailable. */
+  caseEvidence?: CaseEvidence | null;
 }
 
 /**
@@ -28,11 +31,13 @@ export interface VerdictReportContext {
  */
 const LEAD_BY_VERDICT: Record<Verdict, string> = {
   'verified-fix':
-    '**Verified fix** — Run A failed on the base commit as expected and Run B passes on head. The new tests genuinely reproduce the PR change.',
+    '**Verified fix** — the targeted run failed on base and passed on head. The aggregate result does not verify every test case independently.',
+  'mixed-test':
+    '**Mixed test evidence** — some cases failed on base and passed on head, while others passed on both.',
   'weak-test':
-    '**Weak or non-reproducing test** — the new tests pass on the base commit too, so they do not verify the PR change.',
+    '**Weak or non-reproducing test** — the targeted run passed on both base and head, so it did not demonstrate a failure on base.',
   'broken-implementation':
-    '**Broken implementation** — the PR still fails its own new tests on head.',
+    '**Broken implementation** — the targeted run still fails on head.',
   'new-symbol':
     '**New feature test** — Run A fails with an import or syntax error, which is expected when a PR introduces a new symbol, and Run B passes. Annotated as neutral rather than a failure.',
   'environment-failure':
@@ -45,6 +50,7 @@ const LEAD_BY_VERDICT: Record<Verdict, string> = {
  */
 const TITLE_BY_VERDICT: Record<Verdict, string> = {
   'verified-fix': 'Differential verification passed',
+  'mixed-test': 'Mixed reproducing and non-reproducing tests',
   'weak-test': 'Weak or non-reproducing test detected',
   'broken-implementation': 'Implementation fails its own tests',
   'new-symbol': 'New feature test (base import/syntax error)',
@@ -54,6 +60,7 @@ const TITLE_BY_VERDICT: Record<Verdict, string> = {
 /** The verdict's human name, used as the matrix table row's third column. */
 const NAME_BY_VERDICT: Record<Verdict, string> = {
   'verified-fix': 'Verified fix',
+  'mixed-test': 'Mixed test evidence',
   'weak-test': 'Weak / non-reproducing test',
   'broken-implementation': 'Broken implementation',
   'new-symbol': 'New feature test',
@@ -62,6 +69,8 @@ const NAME_BY_VERDICT: Record<Verdict, string> = {
 
 const RUN_A_HEADING = 'Run A — base + new tests';
 const RUN_B_HEADING = 'Run B — head + new tests';
+const MAX_MARKDOWN_CASES = 20;
+const MAX_MARKDOWN_ID_LENGTH = 160;
 
 /** Formats milliseconds as seconds with exactly one decimal, e.g. 400 → "0.4s". */
 function formatSeconds(durationMs: number): string {
@@ -117,15 +126,47 @@ function renderRun(heading: string, outcome: SandboxRunOutcome): string {
   return `### ${heading}\n\n${statusLine}\n\n${renderExcerpt(outcome.logExcerpt)}`;
 }
 
+/** Render untrusted test names as plain text in a Markdown table cell. */
+function escapeCaseId(id: string): string {
+  const clipped = id.length > MAX_MARKDOWN_ID_LENGTH
+    ? `${id.slice(0, MAX_MARKDOWN_ID_LENGTH)}…`
+    : id;
+  return clipped.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, ' ')
+    // Entities prevent table delimiters, HTML, autolinks and mentions from
+    // being interpreted as Markdown (including backticks and backslashes).
+    .replace(/[!-/:-@[-`{-~]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+}
+
+function renderCaseEvidence(evidence: CaseEvidence | null): string {
+  const heading = '### Test case evidence';
+  if (evidence === null) {
+    return `${heading}\n\n_Individual test case evidence is unavailable; the verdict uses aggregate run outcomes._`;
+  }
+
+  const counts = `Reproducing (fail → pass): **${evidence.reproducing}** · ` +
+    `Non-reproducing (pass → pass): **${evidence.nonReproducing}** · ` +
+    `Total case identities: **${evidence.totalCases}**`;
+  const scope = 'The comparison uses cases reported from all tests run in the targeted test files, ' +
+    'not just cases edited by the PR.';
+  const cases = selectCaseDetails(evidence.cases, MAX_MARKDOWN_CASES);
+  const table = [
+    '| Test case | Base | Head |',
+    '| :--- | :--- | :--- |',
+    ...cases.map(({ id, base, head }) => `| ${escapeCaseId(id)} | ${base} | ${head} |`),
+  ].join('\n');
+  const blocks = [heading, scope, counts];
+  if (cases.length > 0) blocks.push(table);
+  if (cases.length < evidence.totalCases) {
+    blocks.push(`_Showing ${cases.length} of ${evidence.totalCases} case identities._`);
+  }
+  return blocks.join('\n\n');
+}
+
 /**
  * Builds the Markdown check-run title and summary for a verdict.
  *
- * The summary has exactly five blocks, in this order:
- *   1. the verdict statement (bold lead),
- *   2. the fired matrix row as a one-row table,
- *   3. Run A's heading, status line and log excerpt,
- *   4. Run B's heading, status line and log excerpt,
- *   5. a provenance footer (PR, repo, total duration).
+ * The summary contains the verdict and matrix row, the optional case
+ * evidence section, both run logs, and a provenance footer.
  */
 export function buildVerdictReport(
   verdict: Verdict,
@@ -146,6 +187,7 @@ export function buildVerdictReport(
     summary: [
       LEAD_BY_VERDICT[verdict],
       matrixRow,
+      ...(ctx.caseEvidence === undefined ? [] : [renderCaseEvidence(ctx.caseEvidence)]),
       renderRun(RUN_A_HEADING, a),
       renderRun(RUN_B_HEADING, b),
       footer,

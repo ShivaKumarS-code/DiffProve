@@ -2,24 +2,17 @@
  * Dispatches a parsed GitHub webhook to the application's ports.
  *
  * This is the seam between HTTP concerns (signature verification, parsing,
- * status codes) and infrastructure concerns (queue, GitHub checks, database
- * persistence). It has no knowledge of Fastify, BullMQ, Octokit, or Postgres so
+ * status codes) and infrastructure concerns (queue, database persistence).
+ * It has no knowledge of Fastify, BullMQ, Octokit, or Postgres so
  * it can be unit-tested with fakes.
  */
 
 import type { InstallationStore } from '../db/types.js';
-import type {
-  CheckRunInput,
-  CheckRunPoster,
-  Enqueuer,
-  Logger,
-  VerificationJob,
-} from '../domain.js';
+import type { Enqueuer, Logger, VerificationJob } from '../domain.js';
 import type { ParsedWebhook } from './events.js';
 
 export interface WebhookDeps {
   enqueuer: Enqueuer;
-  checkPoster: CheckRunPoster;
   /**
    * Installation lifecycle persistence (`installations` table, architecture
    * "Core Data Model"). Null when PostgreSQL is not configured: installation
@@ -88,44 +81,17 @@ async function handlePullRequestEvent(
     headSha: event.headSha,
   };
 
-  // Ordering rationale: the job is the durable record of the request, so
-  // enqueue it first and only then create the visible `queued` check run.
-  // Returning 500 on either failure makes GitHub retry the webhook delivery,
-  // and per-(repo, PR, head-sha) job-id dedupe upstream makes those retries
-  // safe: a duplicate delivery re-uses the same job instead of running twice.
-  let jobId: string;
+  // The durable job is the acknowledgement boundary. Only its worker may
+  // create/update a check run, even if the job has already started by now.
   try {
-    const enqueueResult = await deps.enqueuer.enqueue(job);
-    jobId = enqueueResult.jobId;
+    const { jobId } = await deps.enqueuer.enqueue(job);
+    return { statusCode: 202, message: `queued verification job ${jobId}` };
   } catch (error) {
     deps.logger.error(
       `failed to enqueue verification job for ${event.repoFullName}#${event.prNumber}@${event.headSha}: ${describeError(error)}`,
     );
-    // Do not post the check run: the job never landed, so a check run would
-    // promise verification that will never happen.
     return { statusCode: 500, message: 'failed to enqueue verification job' };
   }
-
-  const checkRunInput: CheckRunInput = {
-    repoFullName: event.repoFullName,
-    headSha: event.headSha,
-    installationId: event.installationId,
-  };
-  try {
-    await deps.checkPoster.postQueuedCheckRun(checkRunInput);
-  } catch (error) {
-    deps.logger.error(
-      `verification job ${jobId} enqueued but queued check run creation failed for ${event.repoFullName}#${event.prNumber}@${event.headSha}: ${describeError(error)}`,
-    );
-    // Return 500 anyway: GitHub retries, and the deduped job id keeps the
-    // retry from creating a second verification run.
-    return {
-      statusCode: 500,
-      message: 'verification job enqueued but check run creation failed',
-    };
-  }
-
-  return { statusCode: 202, message: `queued verification job ${jobId}` };
 }
 
 /**

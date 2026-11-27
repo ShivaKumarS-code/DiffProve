@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { summarizeCaseEvidence } from './case-evidence.js';
 import { conclusionForVerdict, verdictFrom } from './matrix.js';
 import type { RunStatus, SandboxRunOutcome, Verdict } from './types.js';
 
@@ -32,6 +33,38 @@ describe('verdictFrom — documented matrix rows', () => {
 
   it('maps syntax-error + PASS to new-symbol', () => {
     expect(verdictFrom(outcome('syntax-error'), outcome('pass'))).toBe('new-symbol');
+  });
+});
+
+describe('verdictFrom — case evidence', () => {
+  const mixed = summarizeCaseEvidence(
+    [{ id: 'fixed', status: 'fail' }, { id: 'weak', status: 'pass' }],
+    [{ id: 'fixed', status: 'pass' }, { id: 'weak', status: 'pass' }],
+  );
+
+  it('maps aggregate fail + pass with both kinds of evidence to mixed-test', () => {
+    expect(verdictFrom(outcome('fail'), outcome('pass'), mixed)).toBe('mixed-test');
+  });
+
+  it('keeps the aggregate verdict if one transition count is zero or evidence is unavailable', () => {
+    const nonReproducing = summarizeCaseEvidence(
+      [{ id: 'not run', status: 'skipped' }, { id: 'weak', status: 'pass' }],
+      [{ id: 'not run', status: 'pass' }, { id: 'weak', status: 'pass' }],
+    );
+    const reproducing = summarizeCaseEvidence(
+      [{ id: 'fixed', status: 'fail' }],
+      [{ id: 'fixed', status: 'pass' }, { id: 'unknown on base', status: 'pass' }],
+    );
+    for (const evidence of [nonReproducing, reproducing, null, undefined]) {
+      expect(verdictFrom(outcome('fail'), outcome('pass'), evidence)).toBe('verified-fix');
+    }
+  });
+
+  it('does not override new-feature, setup, weak-test or broken implementation outcomes', () => {
+    expect(verdictFrom(outcome('import-error'), outcome('pass'), mixed)).toBe('new-symbol');
+    expect(verdictFrom(outcome('timeout'), outcome('pass'), mixed)).toBe('environment-failure');
+    expect(verdictFrom(outcome('pass'), outcome('pass'), mixed)).toBe('weak-test');
+    expect(verdictFrom(outcome('fail'), outcome('fail'), mixed)).toBe('broken-implementation');
   });
 });
 
@@ -89,6 +122,7 @@ describe('verdictFrom — undefined combinations stay conservative', () => {
 describe('conclusionForVerdict', () => {
   const CASES: ReadonlyArray<readonly [Verdict, 'success' | 'failure' | 'neutral']> = [
     ['verified-fix', 'success'],
+    ['mixed-test', 'failure'],
     ['weak-test', 'failure'],
     ['broken-implementation', 'failure'],
     ['new-symbol', 'neutral'],

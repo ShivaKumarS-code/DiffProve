@@ -1,36 +1,22 @@
 /**
- * Durable verification queue front (Phase 1).
- *
- * The architecture's "Job Orchestrator" component owns durable queuing,
- * per-repo concurrency caps, and retry policies (BullMQ + Redis). Phase 1 only
- * needs the durable enqueue half: the webhook layer calls `Enqueuer.enqueue`
- * after it posts the `queued` check run, and `src/queue/worker.ts` hands the
- * job to a pluggable handler. The real differential pipeline (Run A / Run B)
- * lands in Phases 2-3.
- *
- * Constructing a `Queue` does not open a Redis socket until the first command,
- * so this module imports cleanly — and its unit tests run — on machines with no
- * Redis. Only the integration test (gated on `REDIS_URL`) ever awaits
- * `enqueue`.
+ * Durable verification queue front. Webhooks acknowledge after enqueueing;
+ * only the worker performs GitHub check operations.
  */
 
 import { Queue } from 'bullmq';
 import { Redis } from 'ioredis';
 
-import type { EnqueueResult, Enqueuer, VerificationJob } from '../domain.js';
+import { type EnqueueResult, type Enqueuer, type VerificationJob, verificationKey } from '../domain.js';
 
 // BullMQ v6 rejects queue names containing ':' (it throws synchronously at
 // Queue construction, before any Redis connection), so the queue name uses a
 // dash-separated form.
 export const VERIFICATION_QUEUE_NAME = 'diffprove-verification';
+export const VERIFY_JOB_NAME = 'verify';
 
-/** Deterministic, deduplicating job id: 'verify~<owner>~<repo>~<pr>~<headSha>'. */
+/** Use the same pinned verification identity for the job and the GitHub check. */
 export function jobIdFor(job: VerificationJob): string {
-  // Every '/' is flattened to '~' so "octocat/hello-world" contributes a single
-  // id segment; a repoFullName without a slash still yields a usable id.
-  const repo = job.repoFullName.replaceAll('/', '~');
-
-  return `verify~${repo}~${job.prNumber}~${job.headSha}`;
+  return verificationKey(job);
 }
 
 /**
@@ -42,19 +28,21 @@ export function jobIdFor(job: VerificationJob): string {
  * `quit()` the socket would keep the process alive. Callers (server shutdown,
  * tests) are responsible for invoking `close()` exactly once.
  */
-export function createEnqueuer(redisUrl: string): Enqueuer & { close(): Promise<void> } {
+export function createEnqueuer(redisUrl: string, prefix?: string): Enqueuer & { close(): Promise<void> } {
   // BullMQ requires `maxRetriesPerRequest: null` so blocking commands never
   // give up mid-flight (its own workers duplicate this option for polling).
   const connection = new Redis(redisUrl, { maxRetriesPerRequest: null });
-  const queue = new Queue(VERIFICATION_QUEUE_NAME, { connection });
+  const queue = new Queue(VERIFICATION_QUEUE_NAME, {
+    connection,
+    ...(prefix === undefined ? {} : { prefix }),
+  });
 
   return {
     async enqueue(job: VerificationJob): Promise<EnqueueResult> {
       // Re-adding a job that already exists with the same jobId is a no-op that
-      // returns the existing job — this is what makes GitHub webhook retries
-      // safe: a redelivered `pull_request` event cannot run the same PR head
-      // twice.
-      const added = await queue.add('verify', job, {
+      // preserves stored data (including checkRunId) and dedupes concurrent
+      // deliveries of the same pinned base/head while the job is retained.
+      const added = await queue.add(VERIFY_JOB_NAME, job, {
         jobId: jobIdFor(job),
         attempts: 3,
         backoff: { type: 'exponential', delay: 2000 },

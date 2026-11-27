@@ -14,6 +14,8 @@
  * "persistence not configured" and degrades gracefully (Phase 3 behavior).
  */
 
+import type { CaseEvidence } from '../runner/case-evidence.js';
+
 /** A repository row (`repositories` table). */
 export interface RepositoryRow {
   /** uuid primary key. */
@@ -43,13 +45,15 @@ export interface VerificationRunRow {
   runAStatus: string;
   /** `RunStatus` of Run B. */
   runBStatus: string;
-  /** `Verdict` (verified-fix | weak-test | broken-implementation | new-symbol | environment-failure). */
+  /** Runner verdict, including `mixed-test` when case evidence contradicts a verified fix. */
   verdict: string;
   durationMs: number;
   /** Clipped log excerpt from Run A (stored for the dashboard and reports). */
   runALog: string;
   /** Clipped log excerpt from Run B. */
   runBLog: string;
+  /** Absent on older API payloads; null when no usable evidence was recorded. */
+  caseEvidence?: CaseEvidence | null;
   createdAt: Date;
 }
 
@@ -57,13 +61,14 @@ export interface VerificationRunRow {
  * Run history plus the weak-test catch rate for a repository.
  *
  * catchRate = weak-test runs / total runs, rounded to 4 decimals; null when
- * there are no runs yet. "Weak-test catch rate" is the dashboard's headline
- * metric for how often DiffProve flags non-reproducing tests.
+ * there are no runs yet. Mixed runs count only in the denominator.
  */
 export interface RunHistorySummary {
   runs: VerificationRunRow[];
   totalRuns: number;
   weakTestCount: number;
+  /** Separate whole-history total; absent from older API payloads. */
+  mixedTestCount?: number;
   catchRate: number | null;
 }
 
@@ -120,6 +125,7 @@ export interface VerificationRunInsert {
   durationMs: number;
   runALog: string;
   runBLog: string;
+  caseEvidence?: CaseEvidence | null;
 }
 
 /** Port: verification run persistence and history queries. */
@@ -133,7 +139,7 @@ export interface VerificationRunStore {
 /**
  * Port: the worker's pre-run lookup of repo config overrides
  * (architecture pipeline step 2: "repo-configured test globs"). Null resolves
- * to defaults; `enabled: false` leaves a job queued.
+ * to defaults; `enabled: false` skips verification and completes the check.
  */
 export interface RepoConfig {
   testFileGlobs: string[] | null;

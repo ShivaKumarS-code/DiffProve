@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { RepoConfig, RepoConfigStore, VerificationRunStore } from '../db/types.js';
 import type { Logger, VerificationJob } from '../domain.js';
-import { DEFAULT_TEST_GLOBS } from '../diff/types.js';
+import { DEFAULT_TEST_GLOBS, NO_TEST_CHANGES_TITLE } from '../diff/types.js';
 import type { CheckRunReporter, PrDiffClient } from '../diff/types.js';
 import type {
   DifferentialRunRequest,
@@ -12,9 +12,9 @@ import type {
   RepoContentClient,
   RepoTarballClient,
   SandboxRawResult,
+  TestCaseResult,
   VerdictReporter,
 } from '../runner/types.js';
-import { NO_TEST_CHANGES_TITLE } from '../diff/types.js';
 import { createDifferentialHandler } from './differential-handler.js';
 
 /**
@@ -99,6 +99,13 @@ const JOB: VerificationJob = {
   headSha: 'head456',
 };
 
+const CHECK_RUN_ID = 321;
+const MERGE_BASE_SHA = 'abcdef0123456789abcdef0123456789abcdef01';
+
+function pinnedDiff(diff: string) {
+  return { diff, mergeBaseSha: MERGE_BASE_SHA };
+}
+
 /** A realistic vitest manifest: dependency detection wins over scripts.test. */
 const PACKAGE_JSON = JSON.stringify(
   {
@@ -131,6 +138,7 @@ const EXPECTED_LOCKFILE_KEY = createHash('sha256')
 
 /** Fake gzip header: the handler must pass the bytes through untouched. */
 const TARBALL = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]);
+const HEAD_TARBALL = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00]);
 
 /** Base tree: no new test file yet (the PR adds it). */
 const BASE_FILES = ['package.json', 'package-lock.json', 'src/app.py'];
@@ -153,6 +161,17 @@ const RUN_B_PASS: SandboxRawResult = {
   timedOut: false,
   durationMs: 800,
 };
+
+const REPRODUCING_CASE = 'tests/app.test.ts > reproduces regression';
+const NON_REPRODUCING_CASE = 'tests/app.test.ts > already passes';
+const BASE_CASES: TestCaseResult[] = [
+  { id: REPRODUCING_CASE, status: 'fail' },
+  { id: NON_REPRODUCING_CASE, status: 'pass' },
+];
+const HEAD_CASES: TestCaseResult[] = [
+  { id: REPRODUCING_CASE, status: 'pass' },
+  { id: NON_REPRODUCING_CASE, status: 'pass' },
+];
 
 /** Newly introduced symbol: base cannot resolve the import (guardrail #3). */
 const RUN_A_IMPORT_ERROR: SandboxRawResult = {
@@ -235,19 +254,10 @@ function buildHarness(options: HarnessOptions = {}) {
   };
 }
 
-/**
- * Wires the PR diff and the repo ports for a vitest repo whose base tree has a
- * `package-lock.json`. `headLockfile` overrides the lockfile content fetched at
- * the head commit (default: identical to base, so Run B needs no reinstall).
- */
-function givenVitestRepo(
-  harness: ReturnType<typeof buildHarness>,
-  options: { headLockfile?: string } = {},
-): void {
-  const headLockfile = options.headLockfile ?? LOCKFILE_TEXT;
-
-  harness.prDiff.mockResolvedValue(MIXED_DIFF);
-  harness.fetchTextFile.mockImplementation(async ({ path, ref }) => {
+/** Wires a Vitest repo with identical lockfile contents at base and head. */
+function givenVitestRepo(harness: ReturnType<typeof buildHarness>): void {
+  harness.prDiff.mockResolvedValue(pinnedDiff(MIXED_DIFF));
+  harness.fetchTextFile.mockImplementation(async ({ path }) => {
     if (path === 'package.json') {
       return PACKAGE_JSON;
     }
@@ -255,14 +265,16 @@ function givenVitestRepo(
       return null;
     }
     if (path === 'package-lock.json') {
-      return ref === JOB.headSha ? headLockfile : LOCKFILE_TEXT;
+      return LOCKFILE_TEXT;
     }
     return null;
   });
   harness.listPaths.mockImplementation(async ({ ref }) =>
     ref === JOB.headSha ? HEAD_FILES : BASE_FILES,
   );
-  harness.repoTarball.mockResolvedValue(TARBALL);
+  harness.repoTarball.mockImplementation(async ({ ref }) =>
+    ref === JOB.headSha ? HEAD_TARBALL : TARBALL,
+  );
 }
 
 /** Recorded messages of a fake logger method, in call order. */
@@ -278,9 +290,9 @@ function firstMessage(mock: { mock: { calls: readonly (readonly string[])[] } })
 describe('createDifferentialHandler — no test changes', () => {
   it('reports one neutral check run with the Phase 2 title and summary', async () => {
     const harness = buildHarness();
-    harness.prDiff.mockResolvedValue(IMPL_ONLY_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(IMPL_ONLY_DIFF));
 
-    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+    await expect(harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID })).resolves.toBeUndefined();
 
     expect(harness.prDiff).toHaveBeenCalledTimes(1);
     expect(harness.prDiff).toHaveBeenCalledWith({
@@ -299,6 +311,7 @@ describe('createDifferentialHandler — no test changes', () => {
       repoFullName: 'octocat/hello-world',
       headSha: 'head456',
       installationId: 42,
+      checkRunId: CHECK_RUN_ID,
       title: NO_TEST_CHANGES_TITLE,
       summary:
         `1 changed file(s), none matching the test file globs (${DEFAULT_TEST_GLOBS.join(', ')}). ` +
@@ -321,7 +334,7 @@ describe('createDifferentialHandler — no test changes', () => {
 
   it('names every default test glob and logs the Phase 2 split summary', async () => {
     const harness = buildHarness();
-    harness.prDiff.mockResolvedValue(IMPL_ONLY_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(IMPL_ONLY_DIFF));
 
     await harness.handler(JOB);
 
@@ -337,7 +350,7 @@ describe('createDifferentialHandler — no test changes', () => {
 
   it('short-circuits deleted-only test PRs as neutral without running the suite', async () => {
     const harness = buildHarness();
-    harness.prDiff.mockResolvedValue(DELETED_TEST_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(DELETED_TEST_DIFF));
 
     await expect(harness.handler(JOB)).resolves.toBeUndefined();
 
@@ -352,6 +365,7 @@ describe('createDifferentialHandler — no test changes', () => {
     expect(report?.summary).toContain('tests/test_gone.py');
     expect(report?.summary).toContain('deleted or binary');
     expect(report?.summary).toContain('no runnable tests');
+    expect(report).not.toHaveProperty('checkRunId');
 
     expect(harness.fetchTextFile).not.toHaveBeenCalled();
     expect(harness.listPaths).not.toHaveBeenCalled();
@@ -363,18 +377,22 @@ describe('createDifferentialHandler — no test changes', () => {
 });
 
 describe('createDifferentialHandler — repository disabled', () => {
-  it('leaves the job queued without fetching the diff or calling any other port', async () => {
+  it('completes the exact check as neutral without fetching the diff', async () => {
     const harness = buildHarness({ repoConfig: { ...DEFAULT_REPO_CONFIG, enabled: false } });
 
-    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+    await expect(harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID })).resolves.toBeUndefined();
 
-    // The lookup happens first and the `enabled: false` short-circuit returns
-    // before the diff, so nothing downstream — GitHub, sandbox, or database —
-    // is touched.
     expect(harness.lookupConfig).toHaveBeenCalledTimes(1);
     expect(harness.lookupConfig).toHaveBeenCalledWith('octocat/hello-world');
     expect(harness.prDiff).not.toHaveBeenCalled();
-    expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
+    expect(harness.reportNoTestChanges).toHaveBeenCalledExactlyOnceWith({
+      repoFullName: JOB.repoFullName,
+      headSha: JOB.headSha,
+      installationId: JOB.installationId,
+      checkRunId: CHECK_RUN_ID,
+      title: 'Differential verification is disabled',
+      summary: expect.stringContaining('this repository has disabled it'),
+    });
     expect(harness.fetchTextFile).not.toHaveBeenCalled();
     expect(harness.listPaths).not.toHaveBeenCalled();
     expect(harness.repoTarball).not.toHaveBeenCalled();
@@ -386,24 +404,44 @@ describe('createDifferentialHandler — repository disabled', () => {
     const warning = firstMessage(harness.warn);
     expect(warning).toContain('octocat/hello-world');
     expect(warning).toContain('disabled');
-    expect(warning).toContain('queued');
     expect(harness.error).not.toHaveBeenCalled();
+  });
+
+  it('rethrows a failed neutral completion so the worker can retry the same check', async () => {
+    const harness = buildHarness({ repoConfig: { ...DEFAULT_REPO_CONFIG, enabled: false } });
+    const job = { ...JOB, checkRunId: CHECK_RUN_ID };
+    const failure = new Error('failed to complete check run: HTTP 500');
+    harness.reportNoTestChanges.mockRejectedValueOnce(failure);
+
+    await expect(harness.handler(job)).rejects.toBe(failure);
+    expect(messagesOf(harness.info).some((message) => message.includes('reported neutral'))).toBe(false);
+    await expect(harness.handler(job)).resolves.toBeUndefined();
+
+    expect(harness.reportNoTestChanges).toHaveBeenCalledTimes(2);
+    expect(harness.reportNoTestChanges.mock.calls[1]?.[0]).toEqual(
+      harness.reportNoTestChanges.mock.calls[0]?.[0],
+    );
+    expect(harness.reportNoTestChanges.mock.calls[0]?.[0]?.checkRunId).toBe(CHECK_RUN_ID);
+    expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
   });
 });
 
 describe('createDifferentialHandler — repo-configured test globs', () => {
   it('splits with the configured globs instead of the defaults', async () => {
     // E2B is off so the handler stops right after splitting: reaching the E2B
-    // warning (instead of the neutral report) proves the diff had test changes.
+    // skip (rather than a no-test-changes skip) proves the diff had test changes.
     const harness = buildHarness({
       runner: null,
       repoConfig: { ...DEFAULT_REPO_CONFIG, testFileGlobs: ['*_snap.py'] },
     });
-    harness.prDiff.mockResolvedValue(SNAPSHOT_TEST_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(SNAPSHOT_TEST_DIFF));
 
     await harness.handler(JOB);
 
-    expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
+    expect(harness.reportNoTestChanges).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ title: 'Differential verification sandbox is unavailable' }),
+    );
     expect(harness.warn).toHaveBeenCalledTimes(1);
     const warning = firstMessage(harness.warn);
     expect(warning).toContain('E2B_API_KEY');
@@ -415,7 +453,7 @@ describe('createDifferentialHandler — repo-configured test globs', () => {
     const harness = buildHarness({
       repoConfig: { ...DEFAULT_REPO_CONFIG, testFileGlobs: ['*_snap.py'] },
     });
-    harness.prDiff.mockResolvedValue(IMPL_ONLY_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(IMPL_ONLY_DIFF));
 
     await harness.handler(JOB);
 
@@ -431,25 +469,33 @@ describe('createDifferentialHandler — repo-configured test globs', () => {
 });
 
 describe('createDifferentialHandler — E2B not configured', () => {
-  it('warns about E2B_API_KEY and leaves the check run queued', async () => {
+  it('completes the exact check as neutral and warns about E2B_API_KEY', async () => {
     const harness = buildHarness({ runner: null });
-    harness.prDiff.mockResolvedValue(MIXED_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(MIXED_DIFF));
 
-    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+    await expect(harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID })).resolves.toBeUndefined();
 
     expect(harness.warn).toHaveBeenCalledTimes(1);
     const warning = firstMessage(harness.warn);
     expect(warning).toContain('E2B_API_KEY');
-    expect(warning).toContain('queued');
+    expect(warning).toContain('skipping');
     expect(warning).toContain('octocat/hello-world#7');
 
-    // Nothing was reported, and no repo/sandbox work was attempted.
-    expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
+    // No contents were fetched and no verdict or run history was recorded.
+    expect(harness.reportNoTestChanges).toHaveBeenCalledExactlyOnceWith({
+      repoFullName: JOB.repoFullName,
+      headSha: JOB.headSha,
+      installationId: JOB.installationId,
+      checkRunId: CHECK_RUN_ID,
+      title: 'Differential verification sandbox is unavailable',
+      summary: expect.stringContaining('E2B is not configured'),
+    });
     expect(harness.fetchTextFile).not.toHaveBeenCalled();
     expect(harness.listPaths).not.toHaveBeenCalled();
     expect(harness.repoTarball).not.toHaveBeenCalled();
     expect(harness.runner).not.toHaveBeenCalled();
     expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
     expect(harness.error).not.toHaveBeenCalled();
   });
 });
@@ -460,7 +506,10 @@ describe('createDifferentialHandler — repo-configured test command', () => {
       repoConfig: { ...DEFAULT_REPO_CONFIG, testCommand: 'npm test -- --runInBand' },
     });
     givenVitestRepo(harness);
-    harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
+    harness.runner.mockResolvedValue({
+      runA: { ...RUN_A_FAIL, caseResults: BASE_CASES },
+      runB: { ...RUN_B_PASS, caseResults: HEAD_CASES },
+    });
     harness.reportVerdict.mockResolvedValue(undefined);
 
     await harness.handler(JOB);
@@ -468,9 +517,14 @@ describe('createDifferentialHandler — repo-configured test command', () => {
     const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
     // The auto-detected command would be `npx vitest run 'tests/app.test.ts'`.
     expect(request?.testCommand).toBe('npm test -- --runInBand');
+    expect(request?.collectCaseResults).toBe(false);
     // Everything else about the run request is unchanged.
     expect(request?.installCommand).toBe('npm ci');
     expect(request?.runnerKind).toBe('vitest');
+    const report = harness.reportVerdict.mock.calls[0]?.[0];
+    expect(report?.verdict).toBe('verified-fix');
+    expect(report?.summary).not.toContain('### Test case evidence');
+    expect(harness.insertRun.mock.calls[0]?.[0]).not.toHaveProperty('caseEvidence');
   });
 
   it('substitutes single-quoted runnable test paths for {files} and {file}', async () => {
@@ -545,7 +599,7 @@ describe('createDifferentialHandler — repo-configured test command', () => {
       const harness = buildHarness({
         repoConfig: { ...DEFAULT_REPO_CONFIG, testCommand: c.testCommand },
       });
-      harness.prDiff.mockResolvedValue(MIXED_DIFF);
+      harness.prDiff.mockResolvedValue(pinnedDiff(MIXED_DIFF));
       harness.fetchTextFile.mockImplementation(async ({ path }) => {
         if (path === 'package.json') {
           return c.packageJson;
@@ -577,61 +631,52 @@ describe('createDifferentialHandler — repo-configured test command', () => {
 });
 
 describe('createDifferentialHandler — verified fix', () => {
-  it('runs both patches in the sandbox once and reports verified-fix/success', async () => {
+  it('tests the merge base and exact PR head and reports verified-fix/success to the exact check', async () => {
     const harness = buildHarness();
     givenVitestRepo(harness);
     harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
     harness.reportVerdict.mockResolvedValue(undefined);
 
-    await expect(harness.handler(JOB)).resolves.toBeUndefined();
+    await expect(harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID })).resolves.toBeUndefined();
 
-    // Manifests and lockfiles are read at the base commit; head only for its tree/lock.
-    expect(harness.fetchTextFile).toHaveBeenCalledWith({
+    expect(JOB.baseSha).not.toBe(MERGE_BASE_SHA);
+    expect(harness.prDiff).toHaveBeenCalledExactlyOnceWith({
       repoFullName: 'octocat/hello-world',
-      path: 'package.json',
-      ref: 'base123',
-      installationId: 42,
-    });
-    expect(harness.fetchTextFile).toHaveBeenCalledWith({
-      repoFullName: 'octocat/hello-world',
-      path: 'pyproject.toml',
-      ref: 'base123',
-      installationId: 42,
-    });
-    expect(harness.listPaths).toHaveBeenNthCalledWith(1, {
-      repoFullName: 'octocat/hello-world',
-      ref: 'base123',
-      installationId: 42,
-    });
-    expect(harness.listPaths).toHaveBeenNthCalledWith(2, {
-      repoFullName: 'octocat/hello-world',
-      ref: 'head456',
+      baseSha: JOB.baseSha,
+      headSha: JOB.headSha,
       installationId: 42,
     });
 
-    // The base tarball is downloaded on the trusted side (no token in the sandbox).
-    expect(harness.repoTarball).toHaveBeenCalledTimes(1);
-    expect(harness.repoTarball).toHaveBeenCalledWith({
-      repoFullName: 'octocat/hello-world',
-      ref: 'base123',
-      installationId: 42,
-    });
+    // All inputs use the tested states, not the base branch tip. Only Run A's
+    // manifests determine the runner; each side provides its own paths and lock.
+    const baseRef = { repoFullName: JOB.repoFullName, ref: MERGE_BASE_SHA, installationId: 42 };
+    const headRef = { ...baseRef, ref: JOB.headSha };
+    expect(harness.fetchTextFile.mock.calls).toStrictEqual([
+      [{ ...baseRef, path: 'package.json' }],
+      [{ ...baseRef, path: 'pyproject.toml' }],
+      [{ ...baseRef, path: 'package-lock.json' }],
+      [{ ...headRef, path: 'package-lock.json' }],
+    ]);
+    expect(harness.listPaths.mock.calls).toStrictEqual([[baseRef], [headRef]]);
+    expect(harness.repoTarball.mock.calls).toStrictEqual([[baseRef], [headRef]]);
 
-    // Exactly one differential run with the exact request the runner expects.
+    // Only the test patch and archive bytes (never tokens) enter the runner.
     expect(harness.runner).toHaveBeenCalledTimes(1);
     const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
     expect(request).toStrictEqual({
       repoFullName: 'octocat/hello-world',
-      baseSha: 'base123',
+      baseSha: MERGE_BASE_SHA,
       headSha: 'head456',
       tarball: TARBALL,
+      headTarball: HEAD_TARBALL,
       testOnlyDiff: TEST_ONLY_SECTION,
-      fullDiff: MIXED_DIFF,
       testCommand: "npx vitest run 'tests/app.test.ts'",
       installCommand: 'npm ci',
-      headInstallCommand: null,
+      headInstallCommand: 'npm ci',
       runnerKind: 'vitest',
       lockfileKey: EXPECTED_LOCKFILE_KEY,
+      headLockfileKey: EXPECTED_LOCKFILE_KEY,
+      collectCaseResults: true,
     });
 
     // Verdict matrix row 1: FAIL + PASS → verified-fix / success.
@@ -641,6 +686,7 @@ describe('createDifferentialHandler — verified fix', () => {
       repoFullName: 'octocat/hello-world',
       headSha: 'head456',
       installationId: 42,
+      checkRunId: CHECK_RUN_ID,
       verdict: 'verified-fix',
       conclusion: 'success',
       title: 'Differential verification passed',
@@ -648,6 +694,9 @@ describe('createDifferentialHandler — verified fix', () => {
     });
     expect(report?.summary).toContain('0.8s');
     expect(report?.summary).toContain('2.0s');
+    expect(report?.summary).toContain('Individual test case evidence is unavailable');
+    expect(report?.summary).toContain(`Tested merge base (Run A): \`${MERGE_BASE_SHA}\``);
+    expect(report?.summary).not.toContain(JOB.baseSha);
 
     // Phase 4, pipeline step 6: the run is persisted once, with the exact row.
     // Each fixture populates exactly one output stream, so the classified
@@ -658,7 +707,7 @@ describe('createDifferentialHandler — verified fix', () => {
       installationId: 42,
       language: 'node',
       prNumber: 7,
-      baseSha: 'base123',
+      baseSha: MERGE_BASE_SHA,
       headSha: 'head456',
       changedTestFiles: ['tests/app.test.ts'],
       runAStatus: 'fail',
@@ -667,6 +716,7 @@ describe('createDifferentialHandler — verified fix', () => {
       durationMs: RUN_A_FAIL.durationMs + RUN_B_PASS.durationMs,
       runALog: RUN_A_FAIL.stderr,
       runBLog: RUN_B_PASS.stdout,
+      caseEvidence: null,
     });
 
     // Persistence happens only after GitHub accepted the verdict.
@@ -685,11 +735,56 @@ describe('createDifferentialHandler — verified fix', () => {
   });
 });
 
-describe('createDifferentialHandler — new symbol', () => {
-  it('maps an unresolved import on base plus a passing head to new-symbol/neutral', async () => {
+describe('createDifferentialHandler — comparable case evidence', () => {
+  it('reports and persists mixed-test evidence when aggregate fail/pass hides a weak case', async () => {
     const harness = buildHarness();
     givenVitestRepo(harness);
-    harness.runner.mockResolvedValue({ runA: RUN_A_IMPORT_ERROR, runB: RUN_B_PASS });
+    harness.runner.mockResolvedValue({
+      runA: { ...RUN_A_FAIL, caseResults: BASE_CASES },
+      runB: { ...RUN_B_PASS, caseResults: HEAD_CASES },
+    });
+
+    await harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID });
+
+    expect(harness.reportVerdict).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        verdict: 'mixed-test',
+        conclusion: 'failure',
+        checkRunId: CHECK_RUN_ID,
+        summary: expect.stringContaining('already passes | pass | pass |'),
+      }),
+    );
+    expect(harness.reportVerdict.mock.calls[0]?.[0]?.summary).toContain(
+      'reproduces regression | fail | pass |',
+    );
+    expect(harness.insertRun).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        verdict: 'mixed-test',
+        caseEvidence: {
+          reproducing: 1,
+          nonReproducing: 1,
+          totalCases: 2,
+          cases: [
+            { id: NON_REPRODUCING_CASE, base: 'pass', head: 'pass' },
+            { id: REPRODUCING_CASE, base: 'fail', head: 'pass' },
+          ],
+        },
+      }),
+    );
+  });
+});
+
+describe('createDifferentialHandler — new symbol', () => {
+  it.each([
+    { runA: RUN_A_IMPORT_ERROR, status: 'import-error' },
+    { runA: { ...RUN_A_IMPORT_ERROR, stderr: 'SyntaxError: Unexpected token' }, status: 'syntax-error' },
+  ])('maps base $status plus passing head to new-symbol/neutral without case evidence', async ({ runA, status }) => {
+    const harness = buildHarness();
+    givenVitestRepo(harness);
+    harness.runner.mockResolvedValue({
+      runA: { ...runA, caseResults: BASE_CASES },
+      runB: { ...RUN_B_PASS, caseResults: HEAD_CASES },
+    });
     harness.reportVerdict.mockResolvedValue(undefined);
 
     await harness.handler(JOB);
@@ -701,8 +796,10 @@ describe('createDifferentialHandler — new symbol', () => {
       conclusion: 'neutral',
       title: 'New feature test (base import/syntax error)',
     });
+    expect(report?.summary).not.toContain('### Test case evidence');
+    expect(harness.insertRun.mock.calls[0]?.[0]).not.toHaveProperty('caseEvidence');
     expect(messagesOf(harness.info)).toContain(
-      'verdict: new-symbol (runA=import-error, runB=pass, 2300ms)',
+      `verdict: new-symbol (runA=${status}, runB=pass, 2300ms)`,
     );
   });
 });
@@ -711,7 +808,10 @@ describe('createDifferentialHandler — environment failure', () => {
   it('never lets a sandbox timeout become a verdict on the PR', async () => {
     const harness = buildHarness();
     givenVitestRepo(harness);
-    harness.runner.mockResolvedValue({ runA: RUN_A_TIMEOUT, runB: RUN_B_PASS });
+    harness.runner.mockResolvedValue({
+      runA: { ...RUN_A_TIMEOUT, caseResults: BASE_CASES },
+      runB: { ...RUN_B_PASS, caseResults: HEAD_CASES },
+    });
     harness.reportVerdict.mockResolvedValue(undefined);
 
     await harness.handler(JOB);
@@ -724,44 +824,92 @@ describe('createDifferentialHandler — environment failure', () => {
       title: 'Sandbox environment failure',
       durationMs: RUN_A_TIMEOUT.durationMs + RUN_B_PASS.durationMs,
     });
+    expect(report?.summary).not.toContain('### Test case evidence');
+    expect(harness.insertRun.mock.calls[0]?.[0]).not.toHaveProperty('caseEvidence');
     expect(messagesOf(harness.info)).toContain(
       'verdict: environment-failure (runA=timeout, runB=pass, 120800ms)',
     );
   });
+
+  it('does not use case results when the head runner reports a command error', async () => {
+    const harness = buildHarness();
+    givenVitestRepo(harness);
+    harness.runner.mockResolvedValue({
+      runA: { ...RUN_A_FAIL, caseResults: BASE_CASES },
+      runB: { ...RUN_B_PASS, exitCode: 127, caseResults: HEAD_CASES },
+    });
+
+    await harness.handler(JOB);
+
+    const report = harness.reportVerdict.mock.calls[0]?.[0];
+    expect(report).toMatchObject({ verdict: 'environment-failure', conclusion: 'neutral' });
+    expect(report?.summary).not.toContain('### Test case evidence');
+    expect(harness.insertRun.mock.calls[0]?.[0]).not.toHaveProperty('caseEvidence');
+  });
 });
 
 describe('createDifferentialHandler — head lockfile differs', () => {
-  it('asks Run B to reinstall from the head lockfile', async () => {
-    const differentLockfile = JSON.stringify(
-      { name: 'example-app', lockfileVersion: 3, packages: { 'left-pad': '1.3.0' } },
-      null,
-      2,
-    );
+  it('passes independently derived hashes and install commands from each tree', async () => {
+    const differentLockfile = "lockfileVersion: '9.0'\nimporters:\n  .: {}\n";
     expect(differentLockfile).not.toBe(LOCKFILE_TEXT);
 
     const harness = buildHarness();
-    givenVitestRepo(harness, { headLockfile: differentLockfile });
+    givenVitestRepo(harness);
+    harness.listPaths.mockResolvedValueOnce(BASE_FILES).mockResolvedValueOnce([
+      'package.json',
+      'pnpm-lock.yaml',
+      'tests/app.test.ts',
+    ]);
+    harness.fetchTextFile
+      .mockResolvedValueOnce(PACKAGE_JSON)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(LOCKFILE_TEXT)
+      .mockResolvedValueOnce(differentLockfile);
     harness.runner.mockResolvedValue({ runA: RUN_A_FAIL, runB: RUN_B_PASS });
     harness.reportVerdict.mockResolvedValue(undefined);
 
     await harness.handler(JOB);
 
     const request: DifferentialRunRequest | undefined = harness.runner.mock.calls[0]?.[0];
+    expect(harness.fetchTextFile).toHaveBeenLastCalledWith({
+      repoFullName: JOB.repoFullName,
+      path: 'pnpm-lock.yaml',
+      ref: JOB.headSha,
+      installationId: JOB.installationId,
+    });
     expect(request?.lockfileKey).toBe(EXPECTED_LOCKFILE_KEY);
+    expect(request?.headLockfileKey).toBe(createHash('sha256').update(differentLockfile, 'utf8').digest('hex'));
     expect(request?.installCommand).toBe('npm ci');
-    expect(request?.headInstallCommand).toBe('npm ci');
+    expect(request?.headInstallCommand).toBe('npx --yes pnpm install --frozen-lockfile');
+  });
+});
+
+describe('createDifferentialHandler — head archive failure', () => {
+  it('rethrows for retry rather than replaying the full diff or reporting an outcome', async () => {
+    const harness = buildHarness();
+    givenVitestRepo(harness);
+    const failure = new Error('failed to download head tarball: HTTP 500');
+    harness.repoTarball.mockImplementation(async ({ ref }) => {
+      if (ref === JOB.headSha) throw failure;
+      return TARBALL;
+    });
+
+    await expect(harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID })).rejects.toBe(failure);
+
+    expect(harness.runner).not.toHaveBeenCalled();
+    expect(harness.reportNoTestChanges).not.toHaveBeenCalled();
+    expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
   });
 });
 
 describe('createDifferentialHandler — unsupported repository', () => {
-  it('rejects before any sandbox work when no runner is detectable', async () => {
+  it('completes the exact check as neutral before any sandbox work', async () => {
     const harness = buildHarness();
-    harness.prDiff.mockResolvedValue(MIXED_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(MIXED_DIFF));
     harness.fetchTextFile.mockResolvedValue(null);
 
-    await expect(harness.handler(JOB)).rejects.toThrow(
-      'no supported test runner detected (expected pytest, vitest, or jest)',
-    );
+    await expect(harness.handler({ ...JOB, checkRunId: CHECK_RUN_ID })).resolves.toBeUndefined();
 
     // Only the two manifest probes ran; no tree listing, tarball, or sandbox.
     expect(harness.fetchTextFile).toHaveBeenCalledTimes(2);
@@ -769,9 +917,18 @@ describe('createDifferentialHandler — unsupported repository', () => {
     expect(harness.repoTarball).not.toHaveBeenCalled();
     expect(harness.runner).not.toHaveBeenCalled();
     expect(harness.reportVerdict).not.toHaveBeenCalled();
+    expect(harness.insertRun).not.toHaveBeenCalled();
 
-    expect(harness.error).toHaveBeenCalledTimes(1);
-    expect(firstMessage(harness.error)).toContain('no supported test runner detected');
+    expect(harness.reportNoTestChanges).toHaveBeenCalledExactlyOnceWith({
+      repoFullName: JOB.repoFullName,
+      headSha: JOB.headSha,
+      installationId: JOB.installationId,
+      checkRunId: CHECK_RUN_ID,
+      title: 'No supported test runner detected',
+      summary: expect.stringContaining(MERGE_BASE_SHA),
+    });
+    expect(firstMessage(harness.warn)).toContain('no supported test runner detected');
+    expect(harness.error).not.toHaveBeenCalled();
   });
 });
 
@@ -822,7 +979,7 @@ describe('createDifferentialHandler — verdict report failure', () => {
 describe('createDifferentialHandler — no database configured', () => {
   it('splits with the default globs when no config store is configured', async () => {
     const harness = buildHarness({ repoConfigStore: null });
-    harness.prDiff.mockResolvedValue(IMPL_ONLY_DIFF);
+    harness.prDiff.mockResolvedValue(pinnedDiff(IMPL_ONLY_DIFF));
 
     await harness.handler(JOB);
 
@@ -840,6 +997,7 @@ describe('createDifferentialHandler — no database configured', () => {
     await expect(harness.handler(JOB)).resolves.toBeUndefined();
 
     expect(harness.reportVerdict).toHaveBeenCalledTimes(1);
+    expect(harness.reportVerdict.mock.calls[0]?.[0]).not.toHaveProperty('checkRunId');
     expect(harness.insertRun).not.toHaveBeenCalled();
     expect(harness.error).not.toHaveBeenCalled();
     expect(messagesOf(harness.info)).toContain(

@@ -1,7 +1,7 @@
 # Differential PR Verifier (GitHub App)
 
 ## Overview
-- **Goal:** Deploy a hosted GitHub App that validates AI-authored (and human) pull requests using **differential verification**. Instead of trusting an agent's self-reported passing tests, it runs the PR's new/modified tests in an isolated cloud sandbox against both the **reverted base commit** (must fail) and the **patched head commit** (must pass)—catching weak, tautological, or hallucinated tests before human code review.
+- **Goal:** Deploy a hosted GitHub App that validates AI-authored (and human) pull requests using **differential verification**. Tests should fail on the **merge base plus the test-only patch** and pass on the **exact PR head**. Independent cloud sandboxes let DiffProve catch weak or non-reproducing tests before human review.
 - **Research Basis:** *Teaching Agents to Code Reliably* (Oct 2026) and *SWE-Judge* (May 2026).
 - **Primary Deliverable:** Hosted GitHub App + durable job worker + isolated Firecracker sandbox runner + verification dashboard.
 
@@ -9,32 +9,32 @@
 
 ## End-to-End Verification Pipeline
 
-1. **Webhook Intake:** GitHub sends a `pull_request` (`opened`, `synchronize`, `reopened`) webhook. The API verifies the `X-Hub-Signature-256` HMAC, immediately posts a `queued` GitHub Check Run on the PR's `head_sha`, and enqueues a verification job.
-2. **Diff Fetching & Splitting:** The worker pulls the unified PR diff via GitHub API and splits changed files into two patches using repo-configured test globs (`test_*.py`, `*_test.py`, `*.test.ts`, `*.spec.ts`):
-   - **Test-Only Patch:** Only additions/edits to test files.
-   - **Full PR Patch:** Complete implementation + test changes.
-   - *Short-Circuit:* If no test files were added or modified, the Check Run completes immediately with a `neutral` status (*"No test changes detected to verify"*).
-3. **Sandbox Provisioning:** The worker boots an ephemeral Firecracker microVM (via E2B) from a cached environment snapshot keyed by the repo's lockfile hash (`uv.lock`, `poetry.lock`, `requirements.txt`, `package-lock.json`, `pnpm-lock.yaml`). Outbound network egress is disabled before executing untrusted repo code.
-4. **Run A — Base State Verification (Reverted Implementation):**
-   - Check out `base_sha`.
-   - Apply **only** the Test-Only Patch.
+1. **Webhook Intake:** GitHub sends a `pull_request` (`opened`, `synchronize`, `reopened`) webhook. The API verifies the `X-Hub-Signature-256` HMAC and acknowledges the event only after durable BullMQ intake. The worker creates or recovers the check on the pinned PR head after claiming the job.
+2. **Diff Fetching & Splitting:** The worker obtains GitHub's SHA-pinned three-dot comparison and merge base. It extracts the **Test-Only Patch** using repo-configured test globs (`test_*.py`, `*_test.py`, `*.test.ts`, `*.spec.ts`). It fetches the merge-base and head archives on the trusted host; it does not replay the full PR patch to construct the head.
+3. **Sandbox Provisioning:** Run A and Run B use independent Firecracker microVMs (via E2B). Only the untouched merge base may install with approved registry egress. Run B starts offline and must be able to set up its dependencies from local files or a trusted cache seed. A cold cache or a dependency change that cannot be resolved offline produces an environment failure.
+4. **Run A — Base State Verification:**
+   - Materialize the pinned merge-base archive and prepare dependencies before applying any changes.
+   - Close egress, then apply **only** the Test-Only Patch.
    - Execute the targeted test files (`pytest <changed_tests>` or `vitest run <changed_tests>`).
    - **Expected outcome:** `FAIL` (confirming the test actually reproduces the bug or asserts the new feature).
-5. **Run B — Head State Verification (Patched Implementation):**
-   - Reset working tree and apply the **Full PR Patch** (or check out `head_sha`).
+5. **Run B — Head State Verification:**
+   - Materialize the pinned head archive into a clean workspace, without copying the base working tree into it.
    - Execute the exact same targeted test command.
    - **Expected outcome:** `PASS`.
 6. **Verdict Matrix & GitHub Check Report:**
 
-| Run A (Base + New Tests) | Run B (Head + New Tests) | Verdict | GitHub Check Status |
+| Run A (Merge Base + Test Patch) | Run B (Exact PR Head) | Verdict | GitHub Check Conclusion |
 | :--- | :--- | :--- | :--- |
-| **FAIL** | **PASS** | Verified Fix / Valid Test | `success` (Green) |
+| **FAIL** | **PASS** | Verified Fix / Valid Test, unless case evidence is mixed | `success` (Green) |
+| **FAIL** | **PASS** | Mixed Test Evidence (some fail/pass and others pass/pass) | `failure` (Red) |
 | **PASS** | **PASS** | Weak / Non-Reproducing Test | `failure` (Red) |
 | **FAIL** | **FAIL** | Broken Implementation / Failing Test | `failure` (Red) |
-| **SYNTAX / IMPORT ERROR** | **PASS** | New Symbol Test (Feature Addition) | `neutral` or `success` (Annotated) |
-| **ERROR / TIMEOUT** | **ERROR / TIMEOUT** | Sandbox / Env Setup Failure | `neutral` (Warning) |
+| **SYNTAX / IMPORT ERROR** | **PASS** | New Symbol Test (Feature Addition) | `neutral` (Annotated) |
+| **ERROR / TIMEOUT in either run** | | Sandbox / Env Setup Failure | `neutral` (Warning) |
 
-The worker updates the GitHub Check Run with a structured Markdown summary, clipped stdout/stderr excerpts from Run A and Run B, and saves the record to PostgreSQL.
+Where supported, native runner reports link executed cases from the targeted changed test files by identity: fail/pass reproduces the regression, and pass/pass does not. This is execution evidence, not an inventory of every edited case; it can include unchanged cases in those files and miss cases that did not run. Missing, skipped or ambiguous results are not pass/fail evidence. Without usable case evidence, including for custom commands without a collector, the aggregate matrix still applies.
+
+The worker completes the exact check with a Markdown verdict, clipped logs, and optional case evidence, and persists completed comparisons when PostgreSQL is configured. No-test, disabled and unavailable-runner paths end with a neutral check. On verification retry exhaustion, an independent BullMQ finalization job delivers a neutral conclusion with its own bounded retry policy and does not rerun verification. Redis and GitHub updates are not atomic, and stalled verification relies on a fallback handoff. A crash during that fallback, a failed handoff, or exhausted finalization retries can still require operator reconciliation.
 
 ---
 
@@ -42,11 +42,11 @@ The worker updates the GitHub Check Run with a structured Markdown summary, clip
 
 | Component | Responsibility | Recommended Stack |
 | :--- | :--- | :--- |
-| **GitHub App Server** | Webhook HMAC verification, Octokit Check Runs API, installation config | TypeScript (Next.js API / Fastify) or Python (FastAPI) |
-| **Job Orchestrator** | Durable queuing, per-repo concurrency caps, retry policies | BullMQ (Redis) or Inngest |
-| **Sandbox Runner** | Isolated Firecracker microVMs with egress blocking & snapshot forking | E2B (`@e2b/code-interpreter` or `e2b-code-interpreter`) |
-| **Env Snapshot Cache** | Pre-built dependency snapshots keyed by `(repo_id, lockfile_sha256)` | E2B Templates / Snapshots + Redis metadata |
-| **Run History DB** | Installations, repo test configs, verification verdicts, log excerpts | PostgreSQL |
+| **GitHub App Server** | Webhook HMAC verification and installation config | TypeScript, Fastify, Octokit |
+| **Job Orchestrator** | Durable queuing, retry policies and worker-owned Check Run lifecycle | BullMQ (Redis), Octokit |
+| **Sandbox Runner** | Independent Firecracker microVMs with network isolation | E2B SDK |
+| **Env Snapshot Cache** | Trusted, pre-test base snapshots used only to seed dependency caches | E2B Snapshots |
+| **Run History DB** | Installations, repo test configs, verification verdicts, log excerpts and optional case evidence | PostgreSQL |
 | **Web Dashboard** | Repo onboarding, custom test commands, PR verification history & logs | Next.js + Tailwind CSS |
 
 ---
@@ -57,15 +57,15 @@ The worker updates the GitHub Check Run with a structured Markdown summary, clip
 - **`installations`**: `id (uuid, pk)`, `github_installation_id (bigint, unique)`, `account_login (text)`, `created_at (timestamptz)`
 - **`repositories`**: `id (uuid, pk)`, `installation_id (uuid, fk)`, `repo_full_name (text, unique)`, `language (enum: python, node)`, `test_command (text)`, `test_file_globs (text[])`, `enabled (bool)`
 - **`env_snapshots`**: `id (uuid, pk)`, `repository_id (uuid, fk)`, `lockfile_hash (text)`, `sandbox_template_id (text)`, `last_used_at (timestamptz)`
-- **`verification_runs`**: `id (uuid, pk)`, `repository_id (uuid, fk)`, `pr_number (int)`, `base_sha (text)`, `head_sha (text)`, `changed_test_files (text[])`, `run_a_status (text)`, `run_b_status (text)`, `verdict (text)`, `duration_ms (int)`, `run_a_log (text)`, `run_b_log (text)`, `created_at (timestamptz)`
+- **`verification_runs`**: `id (uuid, pk)`, `repository_id (uuid, fk)`, `pr_number (int)`, `base_sha (text)`, `head_sha (text)`, `changed_test_files (text[])`, `run_a_status (text)`, `run_b_status (text)`, `verdict (text)`, `duration_ms (int)`, `run_a_log (text)`, `run_b_log (text)`, `case_evidence (nullable jsonb)`, `created_at (timestamptz)`. The additive migration leaves existing rows intact with no evidence.
 
 ---
 
 ## API & Interface Contracts
 
-- **`POST /webhooks/github`** — Receives `pull_request` and `installation` events; verifies HMAC signature and dispatches queue jobs.
-- **GitHub Check Run Output:** Uses `POST /repos/{owner}/{repo}/check-runs` and `PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}` with structured `output.title`, `output.summary`, and collapsible Run A / Run B logs.
-- **`GET /api/repos/:id/runs`** — Returns verification history and weak-test catch rate for the dashboard.
+- **`POST /webhooks/github`** — Receives `pull_request` and `installation` events. Verified PR events are acknowledged after durable enqueue; intake does not create the check.
+- **GitHub Check Run Output:** After claiming the durable job, the worker recovers or creates the check with a stable `external_id`, stores its ID in the job, and uses `PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}` for that exact ID. The summary includes the verdict, bounded case evidence when available, and collapsible logs. Stable IDs support retry recovery, not exactly-once delivery. Creation, lookup and terminal delivery depend on GitHub and Redis and require live smoke testing.
+- **`GET /api/repos/:id/runs`** — Returns verification history with optional `caseEvidence` (`null` when unavailable): `reproducing`, `nonReproducing`, `totalCases`, and a preview of `{id, base, head}` results reported by the targeted runs. The whole-history `catchRate` remains `weakTestCount / totalRuns` (`null` for no runs); `mixedTestCount` is a separate total and mixed runs only count in the denominator.
 - **`PATCH /api/repos/:id/config`** — Overrides auto-detected `test_command` or `test_file_globs`.
 
 ---
@@ -73,15 +73,16 @@ The worker updates the GitHub Check Run with a structured Markdown summary, clip
 ## Key Engineering Guardrails
 
 1. **Strict Scope for v1:** Support only **Python (`pytest`)** and **TypeScript/JS (`vitest` / `jest`)** repositories with standard lockfiles. Auto-detect runner from `pyproject.toml` or `package.json`.
-2. **Untrusted PR Security:** Disable outbound internet access inside the E2B sandbox *after* dependency installation and *before* running `pytest`/`vitest`, and never inject GitHub tokens or app secrets into the sandbox environment variables.
+2. **Untrusted PR Security:** Keep Run A and Run B in independent VMs with public sandbox ports disabled. Allow only approved registry egress during dependency setup on the untouched merge base, then close egress before applying the patch or running tests. Run B has no outbound network access from boot, even during dependency setup. Never pass GitHub tokens or app secrets into either VM.
 3. **Handle New-Feature `ImportError` Cleanly:** If a PR introduces a brand-new function or module, Run A (base commit + new test) will naturally fail with `ImportError` / `ModuleNotFoundError` / TS compile error. Classify that distinctly from an environment crash so valid feature PRs aren't falsely flagged.
-4. **Lockfile Snapshot Caching:** Cache installed dependency environments by lockfile hash so repeat PR runs execute in under 30 seconds instead of reinstalling packages every run.
+4. **Snapshot Caching:** Only capture trusted base snapshots before applying the test patch or executing tests. Use them as dependency-cache seeds, never as a source of head files. Never snapshot a head run or reuse a post-test environment. The caches live under `/var/tmp/diffprove-packages`: npm, pnpm and Yarn data; pip, uv and Poetry caches; and, where available, a `wheels` directory for pip. The head still needs all required artifacts locally. A warmed pip HTTP cache is not a usable offline index on its own. Snapshot seeding requires E2B filesystem-only snapshot support on the project and a compatible template and envd. The runner never falls back to memory snapshots. If E2B returns `snapshot_filesystem_only_disabled`, enable that mode or supply the required offline dependencies through a trusted prewarmed template or local vendored artifacts.
+5. **Optional Case Evidence:** Treat runner reports and case labels as untrusted input. Missing evidence cannot promote an individual case to pass or fail; displays bound case previews and render case labels as text.
 
 ---
 
 ## MVP Build Phases (Orchestrator Task Breakdown)
 
-- **Phase 1 (GitHub App & Webhook Ingestion):** Register GitHub App, verify webhook signatures, post `queued` Check Runs, and enqueue jobs via BullMQ/Inngest.
+- **Phase 1 (GitHub App & Webhook Ingestion):** Register the GitHub App, verify webhook signatures, durably enqueue jobs and let the worker own Check Runs.
 - **Phase 2 (Diff Splitter):** Build unified-diff parser that cleanly separates test-only hunks from implementation hunks and handles edge cases (deleted tests, pure-refactor PRs).
-- **Phase 3 (E2B Differential Runner):** Implement Firecracker sandbox execution for Run A and Run B with network egress disabled during test execution and lockfile-keyed snapshot caching.
-- **Phase 4 (Verdict Reporting & Dashboard):** Map Run A/B exit codes to rich GitHub Check Run reports and build the Next.js history/config UI.
+- **Phase 3 (E2B Differential Runner):** Run the merge base plus test patch and exact PR head in separate Firecracker VMs with pre-test base cache seeds and offline head execution.
+- **Phase 4 (Verdict Reporting & Dashboard):** Map aggregate results and optional case evidence to GitHub Check Run reports and the Next.js history/config UI.

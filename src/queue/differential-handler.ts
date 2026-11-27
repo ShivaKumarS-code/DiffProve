@@ -2,15 +2,15 @@
  * Differential verification handler (Phase 3, pipeline steps 2-6).
  *
  * docs/architecture.md, "End-to-End Verification Pipeline" steps 2-6: the
- * worker fetches and splits the PR diff, provisions the sandbox, runs Run A
- * (base + Test-Only Patch) and Run B (base + Full PR Patch), maps the outcome
+ * worker fetches and splits the pinned PR diff, runs Run A (merge base +
+ * Test-Only Patch) and Run B (exact PR head) in separate sandboxes, maps the outcome
  * through the verdict matrix, completes the Check Run with the rich Markdown
  * report, and records the run for the dashboard.
  *
  * Phase 4 adds the two database-backed behaviors (architecture, "Core Data
  * Model" and "API & Interface Contracts"):
  *  - the repo's configuration is consulted *before* the diff is fetched, so a
- *    repo whose `enabled` flag is off leaves its job queued, and its
+ *    repo whose `enabled` flag is off is skipped with a neutral check, and its
  *    `test_file_globs` / `test_command` overrides (`PATCH
  *    /api/repos/:id/config`) replace the auto-detected defaults;
  *  - after GitHub accepted the verdict, the run is persisted
@@ -24,10 +24,8 @@
  * Octokit, E2B, and Postgres, and the whole pipeline is unit-testable with
  * canned diffs and fake sandbox results.
  *
- * Failure policy (Phase 2's, kept): a port failure is logged and rethrown so
- * BullMQ retries it; nothing is ever reported as a verdict that was not
- * computed. A job that cannot complete leaves its check run `queued` from
- * Phase 1 — it never claims a result it did not observe.
+ * Port failures propagate so BullMQ retries them; nothing is ever reported as
+ * a verdict that was not computed.
  *
  * No GitHub token ever crosses into the sandbox: the tarball is downloaded on
  * the trusted side and handed to the runner as bytes (guardrail #2).
@@ -45,6 +43,7 @@ import type {
   PrDiffClient,
   SplitResult,
 } from '../diff/types.js';
+import { summarizeCaseEvidence } from '../runner/case-evidence.js';
 import { classifyRun } from '../runner/classify.js';
 import {
   buildInstallCommand,
@@ -69,7 +68,7 @@ export interface DifferentialHandlerDeps {
   checkRuns: CheckRunReporter;
   repoContent: RepoContentClient;
   repoTarball: RepoTarballClient;
-  /** The E2B differential runner; null when E2B is not configured (E2B_API_KEY unset) — jobs are then left queued. */
+  /** The E2B differential runner; null when E2B_API_KEY is unset. */
   runner: DifferentialRunner | null;
   verdicts: VerdictReporter;
   /**
@@ -121,7 +120,6 @@ function buildNoTestChangesSummary(split: SplitResult, testGlobs: readonly strin
  */
 function inferRunnerForCustomCommand(
   testCommand: string,
-  _packageJson: string | null,
   pyprojectToml: string | null,
 ): RunnerKind {
   const normalized = testCommand.toLowerCase();
@@ -158,7 +156,7 @@ export function createDifferentialHandler(
   const { prDiff, checkRuns, repoContent, repoTarball, runner, verdicts, runs, logger } = deps;
 
   return async (job: VerificationJob): Promise<void> => {
-    const { repoFullName, prNumber, baseSha, headSha } = job;
+    const { repoFullName, prNumber, baseSha, headSha, checkRunId } = job;
 
     // Defence in depth: the webhook layer never enqueues a job without an
     // installation, and without an installation token no GitHub call is
@@ -171,6 +169,26 @@ export function createDifferentialHandler(
     }
 
     const installationId = job.installationId;
+    const check = {
+      repoFullName,
+      headSha,
+      installationId,
+      ...(checkRunId === undefined ? {} : { checkRunId }),
+    };
+
+    async function reportSkipped(title: string, summary: string): Promise<void> {
+      const report: NoTestChangesReport = { ...check, title, summary };
+      try {
+        await checkRuns.reportNoTestChanges(report);
+      } catch (error) {
+        logger.error(
+          `failed to report neutral check run for ${repoFullName}#${prNumber}: ${errorMessage(error)}`,
+        );
+        // Retrying completes the same check run; never claim a skip was reported here.
+        throw error;
+      }
+      logger.info(`reported neutral check run for ${repoFullName}#${prNumber}: ${title}`);
+    }
 
     logger.info(
       `verification job received: repo=${repoFullName} pr=${prNumber} head=${headSha} (differential pipeline)`,
@@ -178,25 +196,25 @@ export function createDifferentialHandler(
 
     // Phase 4: the repository's own configuration replaces the hard-coded
     // defaults (architecture pipeline step 2, "repo-configured test globs"). It
-    // is read BEFORE the diff so a disabled repo never touches GitHub at all.
+    // is read before the diff so a disabled repo can skip fetching it.
     const repoConfig = deps.repoConfig
       ? await deps.repoConfig.lookupConfig(repoFullName)
       : null;
 
     if (repoConfig !== null && !repoConfig.enabled) {
-      // "Core Data Model", `repositories.enabled`: the owner turned verification
-      // off for this repo, so the job stays queued — nothing is executed,
-      // reported, or persisted.
       logger.warn(
-        `verification is disabled for repo=${repoFullName} (repositories.enabled = false); ` +
-          `leaving the check run queued for ${repoFullName}#${prNumber}`,
+        `verification is disabled for repo=${repoFullName} (repositories.enabled = false)`,
+      );
+      await reportSkipped(
+        'Differential verification is disabled',
+        'Differential verification was skipped because this repository has disabled it in DiffProve settings.',
       );
       return;
     }
 
-    let diff: string;
+    let comparison: Awaited<ReturnType<PrDiffClient>>;
     try {
-      diff = await prDiff({ repoFullName, baseSha, headSha, installationId });
+      comparison = await prDiff({ repoFullName, baseSha, headSha, installationId });
     } catch (error) {
       logger.error(
         `failed to fetch PR diff for ${repoFullName}#${prNumber} (${baseSha}...${headSha}): ${errorMessage(error)}`,
@@ -206,6 +224,7 @@ export function createDifferentialHandler(
       // losing the job.
       throw error;
     }
+    const { diff, mergeBaseSha } = comparison;
 
     // Repo-configured globs replace the defaults entirely; undefined keeps them
     // (src/diff/split.ts documents the replacement semantics).
@@ -227,53 +246,36 @@ export function createDifferentialHandler(
     // no test files changed, or when only deleted/binary test files matched
     // and no custom testCommand is configured, complete as `neutral` instead of
     // booting a sandbox (which would otherwise run the whole suite).
-    if (!split.hasTestChanges || (split.runnableTestFiles.length === 0 && !repoConfig?.testCommand)) {
-      const report: NoTestChangesReport = {
-        repoFullName,
-        headSha,
-        installationId,
-        title: NO_TEST_CHANGES_TITLE,
-        summary: buildNoTestChangesSummary(split, appliedGlobs),
-      };
-
-      try {
-        await checkRuns.reportNoTestChanges(report);
-      } catch (error) {
-        logger.error(
-          `failed to report neutral check run for ${repoFullName}#${prNumber}: ${errorMessage(error)}`,
-        );
-        // Rethrowing lets BullMQ retry. Reporting twice is idempotent: PATCHing
-        // an already-completed/neutral check run is a no-op.
-        throw error;
-      }
-
-      logger.info(`reported neutral check run (no test changes) for ${repoFullName}#${prNumber}`);
+    if (!split.hasTestChanges || (split.runnableTestFiles.length === 0 && !customTestCommand)) {
+      await reportSkipped(NO_TEST_CHANGES_TITLE, buildNoTestChangesSummary(split, appliedGlobs));
       return;
     }
 
-    // Without E2B there is no sandbox, so there is no way to compute a verdict.
-    // Leave the check run `queued` (Phase 1 state) instead of guessing, and do
-    // not download a tarball or read the repo — nothing downstream can run.
+    // Without E2B nothing downstream can run; record the skip, not a verdict.
     if (runner === null) {
       logger.warn(
-        `E2B is not configured (E2B_API_KEY is unset); leaving the check run queued for ` +
+        `E2B is not configured (E2B_API_KEY is unset); skipping verification for ` +
           `${repoFullName}#${prNumber} (test files: ${split.changedTestFiles.join(', ')})`,
+      );
+      await reportSkipped(
+        'Differential verification sandbox is unavailable',
+        'Differential verification was skipped because E2B is not configured (E2B_API_KEY is unset).',
       );
       return;
     }
 
-    // Detection reads the BASE commit: what the PR *adds* must not decide how
-    // its own tests are executed.
+    // The three-dot patch applies to the merge base, not the branch tip.
+    // What the PR adds must not decide how its own tests are executed.
     const packageJson = await repoContent.fetchTextFile({
       repoFullName,
       path: 'package.json',
-      ref: baseSha,
+      ref: mergeBaseSha,
       installationId,
     });
     const pyprojectToml = await repoContent.fetchTextFile({
       repoFullName,
       path: 'pyproject.toml',
-      ref: baseSha,
+      ref: mergeBaseSha,
       installationId,
     });
 
@@ -282,21 +284,23 @@ export function createDifferentialHandler(
     if (detected !== null) {
       runnerKind = detected.kind;
     } else if (customTestCommand !== null) {
-      runnerKind = inferRunnerForCustomCommand(customTestCommand, packageJson, pyprojectToml);
+      runnerKind = inferRunnerForCustomCommand(customTestCommand, pyprojectToml);
     } else {
-      logger.error(
-        `no supported test runner detected for ${repoFullName}#${prNumber} at ${baseSha} ` +
+      logger.warn(
+        `no supported test runner detected for ${repoFullName}#${prNumber} at ${mergeBaseSha} ` +
           `(looked for vitest/jest in package.json and pytest in pyproject.toml)`,
       );
-      // Guardrail #1: v1 supports only pytest / vitest / jest. Guessing would
-      // risk a false verdict, so fail the job (BullMQ retries; the check run
-      // stays queued).
-      throw new Error('no supported test runner detected (expected pytest, vitest, or jest)');
+      await reportSkipped(
+        'No supported test runner detected',
+        `No pytest, Vitest, or Jest configuration was detected at the pinned merge base ` +
+          `\`${mergeBaseSha}\`, and no custom test command is configured.`,
+      );
+      return;
     }
 
     const baseFiles = await repoContent.listPaths({
       repoFullName,
-      ref: baseSha,
+      ref: mergeBaseSha,
       installationId,
     });
     const headFiles = await repoContent.listPaths({
@@ -305,9 +309,10 @@ export function createDifferentialHandler(
       installationId,
     });
 
-    // The install command describes the BASE state; the test command is the
-    // same targeted invocation for Run A and Run B (pipeline steps 4-5).
+    // Dependency setup follows each VM's own tree, even with matching locks.
+    // Both runs use the same targeted test command (pipeline steps 4-5).
     const installCommand = buildInstallCommand(baseFiles, runnerKind);
+    const headInstallCommand = buildInstallCommand(headFiles, runnerKind);
     // Architecture "API & Interface Contracts": PATCH /api/repos/:id/config
     // overrides the auto-detected `test_command`, so a repo-configured command
     // wins over the one built from the runner kind and changed test files.
@@ -316,8 +321,8 @@ export function createDifferentialHandler(
         ? formatCustomTestCommand(customTestCommand, split.runnableTestFiles)
         : buildTestCommand(runnerKind, split.runnableTestFiles);
 
-    // Snapshot key from the base lockfile, and a second key for head: Run B
-    // must reinstall only when the PR changes dependencies (guardrail #4).
+    // Hash each side's lockfile separately so the runner can check provenance
+    // before using any base dependency cache to seed the head.
     const baseLock = findLockfile(baseFiles);
     const baseLockContent =
       baseLock === null
@@ -325,7 +330,7 @@ export function createDifferentialHandler(
         : await repoContent.fetchTextFile({
             repoFullName,
             path: baseLock.path,
-            ref: baseSha,
+            ref: mergeBaseSha,
             installationId,
           });
     const lockfileKey = baseLockContent === null ? 'none' : sha256Hex(baseLockContent);
@@ -340,33 +345,36 @@ export function createDifferentialHandler(
             ref: headSha,
             installationId,
           });
-    const headLockKey = headLockContent === null ? 'none' : sha256Hex(headLockContent);
+    const headLockfileKey = headLockContent === null ? 'none' : sha256Hex(headLockContent);
 
-    const headInstallCommand =
-      headLockKey === lockfileKey ? null : buildInstallCommand(headFiles, runnerKind);
+    // Fetch the exact pinned archives on the trusted side; only bytes enter
+    // the sandbox, never the token (guardrail #2).
+    const [tarball, headTarball] = await Promise.all([
+      repoTarball({ repoFullName, ref: mergeBaseSha, installationId }),
+      repoTarball({ repoFullName, ref: headSha, installationId }),
+    ]);
 
-    // Fetched on the trusted side and passed as bytes: the token never enters
-    // the sandbox (guardrail #2).
-    const tarball = await repoTarball({ repoFullName, ref: baseSha, installationId });
-
+    const collectCaseResults = customTestCommand === null;
     let raw: DifferentialRawResult;
     try {
       raw = await runner({
         repoFullName,
-        baseSha,
+        baseSha: mergeBaseSha,
         headSha,
         tarball,
+        headTarball,
         testOnlyDiff: split.testOnlyDiff,
-        fullDiff: split.fullDiff,
         testCommand,
         installCommand,
         headInstallCommand,
         runnerKind,
         lockfileKey,
+        headLockfileKey,
+        collectCaseResults,
       });
     } catch (error) {
       logger.error(
-        `differential runner failed for ${repoFullName}#${prNumber} (${baseSha}...${headSha}): ${errorMessage(error)}`,
+        `differential runner failed for ${repoFullName}#${prNumber} (${mergeBaseSha}...${headSha}): ${errorMessage(error)}`,
       );
       // The runner throws only for infrastructure failures (sandbox creation,
       // snapshot/egress problems) — exactly the transient class BullMQ retries.
@@ -378,13 +386,21 @@ export function createDifferentialHandler(
     const outcomeA = classifyRun(raw.runA, runnerKind);
     const outcomeB = classifyRun(raw.runB, runnerKind);
 
-    const verdict = verdictFrom(outcomeA, outcomeB);
+    const comparable =
+      (outcomeA.status === 'pass' || outcomeA.status === 'fail') &&
+      (outcomeB.status === 'pass' || outcomeB.status === 'fail');
+    const evidence =
+      collectCaseResults && comparable
+        ? summarizeCaseEvidence(raw.runA.caseResults, raw.runB.caseResults)
+        : undefined;
+    const verdict = verdictFrom(outcomeA, outcomeB, evidence);
     const conclusion = conclusionForVerdict(verdict);
     const totalMs = raw.runA.durationMs + raw.runB.durationMs;
     const { title, summary } = buildVerdictReport(verdict, outcomeA, outcomeB, {
       repoFullName,
       prNumber,
       durationMs: totalMs,
+      ...(evidence === undefined ? {} : { caseEvidence: evidence }),
     });
 
     logger.info(
@@ -393,14 +409,12 @@ export function createDifferentialHandler(
 
     try {
       await verdicts.reportVerdict({
-        repoFullName,
-        headSha,
-        installationId,
+        ...check,
         prNumber,
         verdict,
         conclusion,
         title,
-        summary,
+        summary: `${summary}\n\nTested merge base (Run A): \`${mergeBaseSha}\`.`,
         runA: outcomeA,
         runB: outcomeB,
         durationMs: totalMs,
@@ -428,7 +442,7 @@ export function createDifferentialHandler(
           installationId,
           language: runnerKind === 'pytest' ? 'python' : 'node',
           prNumber,
-          baseSha,
+          baseSha: mergeBaseSha,
           headSha,
           changedTestFiles: split.changedTestFiles,
           runAStatus: outcomeA.status,
@@ -437,6 +451,7 @@ export function createDifferentialHandler(
           durationMs: totalMs,
           runALog: outcomeA.logExcerpt,
           runBLog: outcomeB.logExcerpt,
+          ...(evidence === undefined ? {} : { caseEvidence: evidence }),
         });
       } catch (error) {
         logger.error(

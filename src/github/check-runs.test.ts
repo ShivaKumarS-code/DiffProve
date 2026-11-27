@@ -1,189 +1,80 @@
 import type { Octokit } from '@octokit/core';
 import { describe, expect, it, vi } from 'vitest';
 
-import { CHECK_RUN_NAME } from './checks.js';
 import { createCheckRunReporter } from './check-runs.js';
 
 const REPORT = {
   repoFullName: 'octocat/hello-world',
   headSha: 'head456',
   installationId: 42,
-  title: 'No test changes detected to verify',
-  summary: 'pure refactor: 2 files, 0 tests',
+  title: 'Differential verification is disabled',
+  summary: 'Verification is disabled for this repository.',
 };
+const GET = 'GET /repos/{owner}/{repo}/check-runs/{check_run_id}';
+const PATCH = 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}';
 
-const LIST_ROUTE = 'GET /repos/{owner}/{repo}/commits/{ref}/check-runs';
-const PATCH_ROUTE = 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}';
-const CREATE_ROUTE = 'POST /repos/{owner}/{repo}/check-runs';
-
-/** Builds the reporter with a fake transport and a fake token source. */
-function buildReporter(): {
-  reporter: ReturnType<typeof createCheckRunReporter>;
-  request: ReturnType<typeof vi.fn>;
-  installation: ReturnType<typeof vi.fn>;
-} {
+function setup() {
   const request = vi.fn();
   const installation = vi.fn().mockResolvedValue({ token: 'ghs_x' });
-  const octokit = { request } as unknown as Octokit;
-  const reporter = createCheckRunReporter(octokit, { installation });
-
+  const reporter = createCheckRunReporter({ request } as unknown as Octokit, { installation });
   return { reporter, request, installation };
 }
 
-/** Reads one recorded `octokit.request` call as `[route, parameters]`. */
-function callAt(
-  request: ReturnType<typeof vi.fn>,
-  index: number,
-): [string, Record<string, unknown>] {
-  return request.mock.calls[index] as [string, Record<string, unknown>];
-}
-
 describe('createCheckRunReporter', () => {
-  it('patches the queued DiffProve check run to completed/neutral', async () => {
-    const { reporter, request, installation } = buildReporter();
-    request
-      .mockResolvedValueOnce({
-        status: 200,
-        data: {
-          total_count: 2,
-          check_runs: [
-            { id: 1, name: 'Other CI' },
-            { id: 77, name: CHECK_RUN_NAME },
-          ],
-        },
-      })
-      .mockResolvedValueOnce({ status: 200, data: {} });
+  it('completes the worker check as neutral with the supplied skip message', async () => {
+    const { reporter, request, installation } = setup();
+    request.mockResolvedValueOnce({ data: { status: 'queued' } });
 
-    await expect(reporter.reportNoTestChanges(REPORT)).resolves.toBeUndefined();
+    await reporter.reportNoTestChanges({ ...REPORT, checkRunId: 77 });
 
-    expect(installation).toHaveBeenCalledTimes(1);
-    expect(installation).toHaveBeenCalledWith(42);
+    expect(installation).toHaveBeenCalledExactlyOnceWith(42);
     expect(request).toHaveBeenCalledTimes(2);
-
-    const [listRoute, listParameters] = callAt(request, 0);
-    expect(listRoute).toBe(LIST_ROUTE);
-    expect(listParameters).toMatchObject({
+    expect(request).toHaveBeenNthCalledWith(1, GET, {
       owner: 'octocat',
       repo: 'hello-world',
-      ref: 'head456',
-      check_name: CHECK_RUN_NAME,
-      per_page: 100,
+      check_run_id: 77,
       headers: { authorization: 'token ghs_x' },
     });
-
-    const [patchRoute, patchParameters] = callAt(request, 1);
-    expect(patchRoute).toBe(PATCH_ROUTE);
-    expect(patchParameters).toMatchObject({
+    expect(request).toHaveBeenNthCalledWith(2, PATCH, {
       owner: 'octocat',
       repo: 'hello-world',
       check_run_id: 77,
       status: 'completed',
       conclusion: 'neutral',
+      output: { title: REPORT.title, summary: REPORT.summary },
       headers: { authorization: 'token ghs_x' },
     });
-    // Report fields flow through untouched ("API & Interface Contracts").
-    expect(patchParameters.output).toEqual({
-      title: 'No test changes detected to verify',
-      summary: 'pure refactor: 2 files, 0 tests',
-    });
   });
 
-  it('POSTs a completed/neutral run when the queued one is absent', async () => {
-    const { reporter, request, installation } = buildReporter();
+  it('does not PATCH again when a skip is retried after its first write', async () => {
+    const { reporter, request } = setup();
     request
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { total_count: 1, check_runs: [{ id: 1, name: 'Other CI' }] },
-      })
-      .mockResolvedValueOnce({ status: 201, data: {} });
+      .mockResolvedValueOnce({ data: { status: 'queued' } })
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ data: { status: 'completed', conclusion: 'neutral' } });
 
-    await expect(reporter.reportNoTestChanges(REPORT)).resolves.toBeUndefined();
+    await reporter.reportNoTestChanges({ ...REPORT, checkRunId: 77 });
+    await reporter.reportNoTestChanges({ ...REPORT, checkRunId: 77, title: 'Changed setup' });
 
-    expect(installation).toHaveBeenCalledTimes(1);
-    expect(installation).toHaveBeenCalledWith(42);
-    expect(request).toHaveBeenCalledTimes(2);
-
-    const routes = request.mock.calls.map((call) => (call as [string])[0]);
-    expect(routes).toEqual([LIST_ROUTE, CREATE_ROUTE]);
-    expect(routes).not.toContain(PATCH_ROUTE);
-
-    const [createRoute, createParameters] = callAt(request, 1);
-    expect(createRoute).toBe(CREATE_ROUTE);
-    expect(createParameters).toMatchObject({
-      owner: 'octocat',
-      repo: 'hello-world',
-      name: CHECK_RUN_NAME,
-      head_sha: 'head456',
-      status: 'completed',
-      conclusion: 'neutral',
-      headers: { authorization: 'token ghs_x' },
-    });
-    expect(createParameters.output).toEqual({
-      title: 'No test changes detected to verify',
-      summary: 'pure refactor: 2 files, 0 tests',
-    });
+    expect(request.mock.calls.map(([route]) => route)).toEqual([GET, PATCH, GET]);
   });
 
-  it('POSTs a completed/neutral run when the head commit has no check runs at all', async () => {
-    const { reporter, request } = buildReporter();
-    request
-      .mockResolvedValueOnce({
-        status: 200,
-        data: { total_count: 0, check_runs: [] },
-      })
-      .mockResolvedValueOnce({ status: 201, data: {} });
+  it('never looks up by name or creates a replacement check when the ID is missing', async () => {
+    const { reporter, request, installation } = setup();
 
-    await expect(reporter.reportNoTestChanges(REPORT)).resolves.toBeUndefined();
+    await expect(reporter.reportNoTestChanges(REPORT)).rejects.toThrow('without the worker check run ID');
 
-    expect(request).toHaveBeenCalledTimes(2);
-    const [createRoute, createParameters] = callAt(request, 1);
-    expect(createRoute).toBe(CREATE_ROUTE);
-    expect(createParameters).toMatchObject({
-      name: CHECK_RUN_NAME,
-      head_sha: 'head456',
-      status: 'completed',
-      conclusion: 'neutral',
-    });
-    expect(createParameters.output).toEqual({
-      title: 'No test changes detected to verify',
-      summary: 'pure refactor: 2 files, 0 tests',
-    });
-  });
-
-  it('rejects a malformed repoFullName without calling GitHub', async () => {
-    const { reporter, request, installation } = buildReporter();
-
-    await expect(
-      reporter.reportNoTestChanges({ ...REPORT, repoFullName: 'no-slash' }),
-    ).rejects.toThrow(/invalid repoFullName: no-slash/);
-
-    expect(request).not.toHaveBeenCalled();
     expect(installation).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
   });
 
-  it('rethrows check-run lookup failures with the HTTP status and repo, without the token', async () => {
-    const { reporter, request } = buildReporter();
-    request.mockRejectedValue(
-      Object.assign(new Error('Request failed with status code 403'), {
-        status: 403,
-        response: { status: 403, headers: {}, data: { message: 'Forbidden' } },
-      }),
-    );
+  it('sanitizes errors from obtaining an installation token', async () => {
+    const { reporter, request, installation } = setup();
+    installation.mockRejectedValueOnce(Object.assign(new Error('private details'), { status: 403 }));
 
-    let thrown: unknown;
-    try {
-      await reporter.reportNoTestChanges(REPORT);
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).toBeInstanceOf(Error);
-    const message = (thrown as Error).message;
-    expect(message).toContain('403');
-    expect(message).toContain('hello-world');
-    expect(message).toContain('head456');
-    expect(message).not.toContain('ghs_x');
-    // A failed lookup must not fall through to creating a run.
-    expect(request).toHaveBeenCalledTimes(1);
+    const failure = reporter.reportNoTestChanges({ ...REPORT, checkRunId: 77 });
+    await expect(failure).rejects.toThrow('failed to complete DiffProve check run as neutral for octocat/hello-world at head456 with HTTP 403');
+    await expect(failure).rejects.not.toHaveProperty('cause');
+    expect(request).not.toHaveBeenCalled();
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Logger } from '../domain.js';
+import { caseReportOptions } from './case-evidence.js';
 import { createE2bDifferentialRunner } from './e2b-runner.js';
 import type {
   DifferentialRunRequest,
@@ -12,859 +12,488 @@ import type {
 
 const STAGING = '/tmp/diffprove';
 const WORKSPACE = `${STAGING}/workspace`;
-const RUN_A = `${STAGING}/run-a`;
-const RUN_B = `${STAGING}/run-b`;
+const BASE = Uint8Array.from([31, 139, 8, 0, 1]);
+const HEAD = Uint8Array.from([31, 139, 8, 0, 2]);
 
-const EXTRACT = `mkdir -p ${WORKSPACE} && tar -xzf ${STAGING}/base.tar.gz -C ${WORKSPACE} --strip-components=1`;
+const ok: SandboxRawResult = { exitCode: 0, stdout: '', stderr: '', timedOut: false, durationMs: 1 };
+const failed = (stderr: string): SandboxRawResult => ({ ...ok, exitCode: 1, stderr });
+const timeout: SandboxRawResult = { ...ok, exitCode: null, stderr: 'timed out', timedOut: true };
 
-function relocateVenv(runDir: string): string {
-  const script = [
-    'from pathlib import Path',
-    `venv = Path("${runDir}/.venv")`,
-    'targets = (',
-    '    list(venv.glob("lib/*/site-packages/*.pth"))',
-    '    + list(venv.glob("lib/*/site-packages/__editable__*.py"))',
-    '    + list(venv.glob("bin/*"))',
-    ')',
-    'for p in targets:',
-    '    if not p.is_file() or p.is_symlink():',
-    '        continue',
-    '    try:',
-    '        text = p.read_text(encoding="utf-8")',
-    '    except (UnicodeDecodeError, OSError):',
-    '        continue',
-    `    if "${WORKSPACE}" in text:`,
-    `        p.write_text(text.replace("${WORKSPACE}", "${runDir}"), encoding="utf-8")`,
-  ].join('\n');
-  return `if [ -d ${runDir}/.venv ]; then python3 -c '${script}'; fi`;
-}
+const request: DifferentialRunRequest = {
+  repoFullName: 'octocat/hello-world',
+  baseSha: 'pinned-merge-base',
+  headSha: 'exact-pr-head',
+  tarball: BASE,
+  headTarball: HEAD,
+  testOnlyDiff: 'test-only-patch',
+  testCommand: "npx jest 'tests/a.test.js'",
+  installCommand: 'npm ci',
+  headInstallCommand: 'npm ci',
+  runnerKind: 'jest',
+  lockfileKey: 'base-lock',
+  headLockfileKey: 'base-lock',
+};
 
-const RELOCATE_RUN_A = relocateVenv(RUN_A);
-const RELOCATE_RUN_B = relocateVenv(RUN_B);
+type CreateOpts = Parameters<SandboxFactory['create']>[0];
+type RunOpts = Parameters<SandboxHandle['run']>[1];
+type Event = (
+  | { kind: 'create'; opts: CreateOpts }
+  | { kind: 'run'; command: string; opts: RunOpts }
+  | { kind: 'write'; path: string; bytes: string | Uint8Array }
+  | { kind: 'deny' | 'snapshot' | 'close' }
+) & { vm: number };
 
-const VERIFY_NODE_DEPS = `[ -d ${WORKSPACE}/node_modules ]`;
-const VERIFY_PYTEST_DEPS = `[ -d ${WORKSPACE}/.venv ] || PATH="${WORKSPACE}/.venv/bin:$PATH" command -v pytest >/dev/null 2>&1`;
-
-const PYTEST_TEST_COMMAND = 'export PATH="$PWD/.venv/bin:$PATH"; pytest "tests/test_a.py"';
-
-const TARBALL = Uint8Array.from([31, 139, 8, 0, 1, 2, 3]);
-
-const ok = (): SandboxRawResult => ({
-  exitCode: 0,
-  stdout: '',
-  stderr: '',
-  timedOut: false,
-  durationMs: 1,
-});
-
-type RunOpts = { cwd?: string; timeoutMs?: number };
-
-type Call =
-  | { kind: 'run'; command: string; opts?: RunOpts }
-  | { kind: 'writeFile'; path: string; content: string | Uint8Array }
-  | { kind: 'network'; denyAll: boolean }
-  | { kind: 'snapshot'; name: string }
-  | { kind: 'close' };
-
-interface FakeFactoryOptions {
-  onRun?: (command: string, opts?: RunOpts) => SandboxRawResult | Promise<SandboxRawResult>;
-  onNetwork?: (denyAll: boolean) => void;
-  onSnapshot?: (name: string) => string | null;
-  createError?: Error;
-  closeError?: Error;
-}
-
-/** Fake `SandboxFactory` that records every handle call in order. */
-function createFakeFactory(options: FakeFactoryOptions = {}) {
-  const calls: Call[] = [];
-  const createCalls: { templateId?: string; apiKey?: string; timeoutMs?: number }[] = [];
-
+function harness(opts: {
+  onCreate?: (vm: number, options: CreateOpts) => void;
+  onRun?: (vm: number, command: string) => SandboxRawResult | undefined;
+  onWrite?: (vm: number, path: string) => void;
+  onDeny?: (vm: number) => void;
+  onClose?: () => void;
+  snapshots?: Map<string, string>;
+  snapshotAvailable?: boolean;
+  withCache?: boolean;
+} = {}) {
+  const events: Event[] = [];
+  const snapshots = opts.snapshots ?? new Map<string, string>();
+  let nextVm = 0;
   const factory: SandboxFactory = {
-    async create(opts) {
-      createCalls.push(opts);
-      if (options.createError) {
-        throw options.createError;
-      }
-      const handle: SandboxHandle = {
-        async run(command, runOpts) {
-          calls.push({ kind: 'run', command, opts: runOpts });
-          return options.onRun ? await options.onRun(command, runOpts) : ok();
+    async create(options) {
+      const vm = nextVm++;
+      events.push({ vm, kind: 'create', opts: options });
+      opts.onCreate?.(vm, options);
+      let marker = snapshots.get(options.templateId ?? '');
+      return {
+        async run(command, commandOpts) {
+          events.push({ vm, kind: 'run', command, opts: commandOpts });
+          return opts.onRun?.(vm, command) ?? (
+            command.includes('/base-snapshot') ? { ...ok, stdout: marker ?? '' } : ok
+          );
         },
-        async writeFile(path, content) {
-          calls.push({ kind: 'writeFile', path, content });
+        async writeFile(path, bytes) {
+          events.push({ vm, kind: 'write', path, bytes });
+          opts.onWrite?.(vm, path);
+          if (path.endsWith('/base-snapshot') && typeof bytes === 'string') marker = bytes;
         },
-        async updateNetworkEgress(denyAll) {
-          calls.push({ kind: 'network', denyAll });
-          options.onNetwork?.(denyAll);
+        async denyNetworkEgress() {
+          events.push({ vm, kind: 'deny' });
+          opts.onDeny?.(vm);
         },
-        async createSnapshot(name) {
-          calls.push({ kind: 'snapshot', name });
-          return options.onSnapshot ? options.onSnapshot(name) : 'snap-ref-1';
+        async createSnapshot() {
+          events.push({ vm, kind: 'snapshot' });
+          if (opts.snapshotAvailable === false) return null;
+          const ref = `snap-${vm}`;
+          if (marker) snapshots.set(ref, marker);
+          return ref;
         },
         async close() {
-          calls.push({ kind: 'close' });
-          if (options.closeError) {
-            throw options.closeError;
-          }
+          events.push({ vm, kind: 'close' });
+          opts.onClose?.();
         },
       };
-      return handle;
     },
   };
-
-  return { factory, calls, createCalls };
+  const refs = new Map<string, string>();
+  const cache = {
+    get: vi.fn<EnvSnapshotCache['get']>(async (_, key) => refs.get(key) ?? null),
+    set: vi.fn<EnvSnapshotCache['set']>(async (_, key, ref) => { refs.set(key, ref); }),
+  };
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  const run = createE2bDifferentialRunner({
+    sandboxFactory: factory,
+    defaultTemplateId: 'default-template',
+    apiKey: 'control-plane-key',
+    snapshotCache: opts.withCache ? cache : undefined,
+    logger,
+  });
+  const forVm = (vm: number) => events.filter((event) => event.vm === vm);
+  const commands = (vm: number) => forVm(vm).filter((event) => event.kind === 'run');
+  const creates = () => events.filter((event) => event.kind === 'create').map((event) => event.opts);
+  const writes = (vm: number) => forVm(vm).filter((event) => event.kind === 'write');
+  const closed = () => events.filter((event) => event.kind === 'close').map((event) => event.vm).sort();
+  return { run, cache, logger, events, forVm, commands, creates, writes, closed };
 }
 
-function createLogger() {
-  const info = vi.fn<(message: string) => void>();
-  const warn = vi.fn<(message: string) => void>();
-  const error = vi.fn<(message: string) => void>();
-  const logger: Logger = { info, warn, error };
-  return { logger, info, warn, error };
-}
+describe('E2B differential runner', () => {
+  it('uses separate VMs with exact archive bytes and a clean, identical workspace path', async () => {
+    const fake = harness({ withCache: true });
+    await expect(fake.run(request)).resolves.toEqual({ runA: ok, runB: ok });
 
-function createFakeCache(options: { value?: string | null; getError?: Error; setError?: Error } = {}) {
-  const get = vi.fn<(repoFullName: string, lockfileKey: string) => Promise<string | null>>();
-  const set = vi.fn<
-    (repoFullName: string, lockfileKey: string, templateRef: string) => Promise<void>
-  >();
-  get.mockResolvedValue(options.value ?? null);
-  if (options.getError) {
-    get.mockRejectedValue(options.getError);
-  }
-  set.mockResolvedValue();
-  if (options.setError) {
-    set.mockRejectedValue(options.setError);
-  }
-  const cache: EnvSnapshotCache = { get, set };
-  return { cache, get, set };
-}
+    expect(fake.creates()).toEqual([
+      {
+        templateId: 'default-template',
+        apiKey: 'control-plane-key',
+        timeoutMs: 720_000,
+        network: { mode: 'registries', allowOut: ['registry.npmjs.org', 'registry.yarnpkg.com'] },
+      },
+      {
+        templateId: 'snap-0',
+        apiKey: 'control-plane-key',
+        timeoutMs: 720_000,
+        network: { mode: 'offline' },
+      },
+    ]);
+    const [base, marker, patch] = fake.writes(0);
+    expect(base).toEqual({ vm: 0, kind: 'write', path: `${STAGING}/base.tar.gz`, bytes: BASE });
+    expect(marker).toMatchObject({ path: expect.stringMatching(/\/base-snapshot$/) });
+    expect(patch).toEqual({
+      vm: 0, kind: 'write', path: `${STAGING}/test-only.patch`, bytes: request.testOnlyDiff,
+    });
+    expect(fake.writes(1)).toEqual([
+      { vm: 1, kind: 'write', path: `${STAGING}/head.tar.gz`, bytes: HEAD },
+    ]);
 
-function runCalls(calls: readonly Call[]): Extract<Call, { kind: 'run' }>[] {
-  return calls.filter((call): call is Extract<Call, { kind: 'run' }> => call.kind === 'run');
-}
+    const a = fake.forVm(0);
+    expect(a.map((event) => event.kind)).toEqual([
+      'create', 'write', 'run', 'run', 'deny', 'write', 'snapshot', 'write', 'run', 'run', 'close',
+    ]);
+    expect(fake.commands(0).map(({ command }) => command)).toEqual([
+      expect.stringContaining(`tar -xzf ${STAGING}/base.tar.gz -C ${WORKSPACE}`),
+      expect.stringMatching(/npm_config_cache=\/var\/tmp\/diffprove-packages\/npm .*&& npm ci$/),
+      `git apply --whitespace=nowarn ${STAGING}/test-only.patch`,
+      request.testCommand,
+    ]);
+    expect(fake.commands(0)[1]?.command).not.toContain('npm_config_offline');
 
-/** Human-readable, order-preserving view of every handle call. */
-function timeline(calls: readonly Call[]): string[] {
-  return calls.map((call) => {
-    switch (call.kind) {
-      case 'run':
-        return `run ${call.command} (cwd=${call.opts?.cwd ?? '-'}, timeout=${call.opts?.timeoutMs ?? '-'})`;
-      case 'writeFile':
-        return `write ${call.path}`;
-      case 'network':
-        return `network denyAll=${call.denyAll}`;
-      case 'snapshot':
-        return `snapshot ${call.name}`;
-      case 'close':
-        return 'close';
+    const b = fake.forVm(1);
+    expect(b.map((event) => event.kind)).toEqual([
+      'create', 'deny', 'run', 'write', 'run', 'run', 'run', 'close',
+    ]);
+    expect(fake.commands(1).map(({ command }) => command)).toEqual([
+      expect.stringMatching(/^head -c \d+ .*\/base-snapshot$/),
+      expect.stringContaining(`rm -rf -- ${WORKSPACE} && mkdir -- ${WORKSPACE} && tar -xzf ${STAGING}/head.tar.gz -C ${WORKSPACE}`),
+      expect.stringMatching(/npm_config_cache=\/var\/tmp\/diffprove-packages\/npm .*npm_config_offline=true .*&& npm ci$/),
+      request.testCommand,
+    ]);
+    for (const vm of [0, 1]) {
+      expect(fake.commands(vm).at(-1)?.opts).toEqual({ cwd: WORKSPACE, timeoutMs: 120_000 });
+    }
+    expect(fake.closed()).toEqual([0, 1]);
+  });
+
+  it('does not restore cached trees even with an unchanged lock; cache identity is merge base + lock', async () => {
+    const fake = harness({ withCache: true });
+    await fake.run(request);
+    await fake.run({ ...request, headSha: 'another-head', headLockfileKey: 'new-head-lock' });
+    await fake.run({ ...request, baseSha: 'another-base' });
+    await fake.run({ ...request, lockfileKey: 'another-base-lock' });
+
+    expect(fake.creates().map(({ templateId }) => templateId)).toEqual([
+      'default-template', 'snap-0', 'snap-0', 'snap-0',
+      'default-template', 'snap-4', 'default-template', 'snap-6',
+    ]);
+    const keys = fake.cache.get.mock.calls.map(([repo, key]) => {
+      expect(repo).toBe(request.repoFullName);
+      expect(key).toMatch(/^locked-base-packages-v3:[a-f0-9]{64}$/);
+      return key;
+    });
+    expect(keys[0]).toBe(keys[1]);
+    expect(new Set(keys).size).toBe(3);
+    expect(fake.cache.set.mock.calls.map(([, key]) => key)).toEqual([keys[0], keys[2], keys[3]]);
+    expect(fake.commands(2).map(({ command }) => command)).toContainEqual(
+      expect.stringContaining(`rm -rf -- ${WORKSPACE} && mkdir -- ${WORKSPACE} && tar -xzf ${STAGING}/base.tar.gz`),
+    );
+    expect(fake.commands(2).map(({ command }) => command)).toContainEqual(
+      expect.stringContaining('npm_config_offline=true'),
+    );
+    expect(fake.events.filter((event) => event.kind === 'snapshot').map(({ vm }) => vm)).toEqual([0, 4, 6]);
+  });
+
+  it.each(['unbootable snapshot', 'mismatched marker', 'unusable package cache'])(
+    'closes and cold-falls back on an %s',
+    async (reason) => {
+      const snapshots = new Map<string, string>();
+      const fake = harness({
+        withCache: true,
+        snapshots,
+        onCreate: (vm) => { if (vm === 0 && reason === 'unbootable snapshot') throw new Error(reason); },
+        onRun: (vm, command) => {
+          if (vm === 0 && reason === 'unusable package cache' && command.includes('&& npm ci')) {
+            return failed('ENOTCACHED');
+          }
+        },
+      });
+      fake.cache.get.mockImplementationOnce(async (_, key) => {
+        // The marker matches but the package payload cannot provision the base.
+        snapshots.set('bad-snap', reason === 'unusable package cache' ? key : 'other-base');
+        return 'bad-snap';
+      });
+      await expect(fake.run(request)).resolves.toEqual({ runA: ok, runB: ok });
+
+      expect(fake.creates().map(({ templateId, network }) => [templateId, network.mode])).toEqual([
+        ['bad-snap', 'offline'], ['default-template', 'registries'], ['snap-1', 'offline'],
+      ]);
+      expect(fake.closed()).toEqual(reason === 'unbootable snapshot' ? [1, 2] : [0, 1, 2]);
+      expect(fake.writes(0).some(({ path }) => path.endsWith('.patch'))).toBe(false);
+      expect(fake.cache.set).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('cold-falls back for a head seed that fails to boot without ever opening head egress', async () => {
+    const fake = harness({ onCreate: (vm) => { if (vm === 1) throw new Error('snapshot gone'); } });
+    await expect(fake.run(request)).resolves.toEqual({ runA: ok, runB: ok });
+    expect(fake.creates().map(({ templateId, network }) => [templateId, network.mode])).toEqual([
+      ['default-template', 'registries'], ['snap-0', 'offline'], ['default-template', 'offline'],
+    ]);
+    expect(fake.writes(1)).toEqual([]);
+    expect(fake.closed()).toEqual([0, 2]);
+  });
+
+  it('uses an in-job seed even if Redis reads and writes fail', async () => {
+    const fake = harness({ withCache: true });
+    fake.cache.get.mockRejectedValueOnce(new Error('Redis lookup rejected'));
+    fake.cache.set.mockRejectedValueOnce(new Error('Redis write rejected'));
+    await expect(fake.run(request)).resolves.toEqual({ runA: ok, runB: ok });
+    expect(fake.creates()[1]?.templateId).toBe('snap-0');
+    expect(fake.logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses to upload a patch, snapshot or test when base lockdown fails, while still running head', async () => {
+    const fake = harness({
+      withCache: true,
+      onDeny: (vm) => { if (vm === 0) throw new Error('denied by platform'); },
+    });
+    await expect(fake.run(request)).resolves.toEqual({
+      runA: { ...ok, exitCode: null, stderr: 'network egress lockdown failed: denied by platform', durationMs: 0 },
+      runB: ok,
+    });
+    expect(fake.forVm(0).map(({ kind }) => kind)).toEqual(['create', 'write', 'run', 'run', 'deny', 'close']);
+    expect(fake.cache.set).not.toHaveBeenCalled();
+    expect(fake.creates()[1]?.network).toEqual({ mode: 'offline' });
+    expect(fake.closed()).toEqual([0, 1]);
+  });
+
+  it('refuses to upload or run any head content if head lockdown cannot be reinforced', async () => {
+    const fake = harness({
+      snapshotAvailable: false,
+      onDeny: (vm) => { if (vm === 1) throw new Error('denied by platform'); },
+    });
+    const result = await fake.run(request);
+    expect(result.runA).toEqual(ok);
+    expect(result.runB.stderr).toContain('network egress lockdown failed');
+    expect(fake.creates()[1]?.network).toEqual({ mode: 'offline' });
+    expect(fake.forVm(1).map(({ kind }) => kind)).toEqual(['create', 'deny', 'close']);
+  });
+
+  it.each([
+    ['base workspace extraction', 'tar -xzf', failed('bad archive')],
+    ['base dependency installation', '&& npm ci', timeout],
+    ['test-only patch application', 'git apply', failed('patch does not apply')],
+  ] as const)('preserves independently retrievable head evidence after %s fails', async (label, command, result) => {
+    const fake = harness({
+      onRun: (vm, text) => vm === 0 && text.includes(command) ? result : undefined,
+    });
+    const raw = await fake.run({ ...request, headInstallCommand: null });
+    expect(raw).toEqual({
+      runA: { ...result, exitCode: null, stderr: `${label} failed:\n${result.stderr}` },
+      runB: ok,
+    });
+    expect(fake.commands(0).some(({ command }) => command === request.testCommand)).toBe(false);
+    expect(fake.commands(1).at(-1)?.command).toBe(request.testCommand);
+    expect(fake.closed()).toEqual([0, 1]);
+  });
+
+  it('returns an environment failure for uncached head dependencies and never retries online', async () => {
+    const fake = harness({
+      snapshotAvailable: false,
+      onRun: (vm, command) => vm === 1 && command.includes('npm install') ? failed('ENOTCACHED') : undefined,
+    });
+    await expect(fake.run({ ...request, headInstallCommand: 'npm install', headLockfileKey: 'changed' }))
+      .resolves.toEqual({
+        runA: ok,
+        runB: { ...ok, exitCode: null, stderr: 'head dependency installation failed:\nENOTCACHED' },
+      });
+    expect(fake.creates().map(({ network }) => network.mode)).toEqual(['registries', 'offline']);
+    expect(fake.forVm(1).map(({ kind }) => kind)).toEqual(['create', 'deny', 'write', 'run', 'run', 'close']);
+    expect(fake.commands(1).at(-1)?.command).toContain('npm_config_offline=true');
+  });
+
+  it('warms standard pip wheels before base lockdown but creates a new head venv offline', async () => {
+    const fake = harness();
+    const testCommand = "pytest 'tests/test_a.py'";
+    await fake.run({
+      ...request,
+      runnerKind: 'pytest',
+      testCommand,
+      installCommand: "pip install -r 'requirements.txt'",
+      headInstallCommand: "pip install -r 'requirements.txt'",
+    });
+    expect(fake.creates()[0]?.network).toEqual({
+      mode: 'registries', allowOut: ['pypi.org', 'files.pythonhosted.org'],
+    });
+    const base = fake.forVm(0);
+    const wheel = base.findIndex((event) => event.kind === 'run' && event.command.includes('pip wheel'));
+    expect(wheel).toBeGreaterThan(0);
+    expect(wheel).toBeLessThan(base.findIndex((event) => event.kind === 'deny'));
+    const headInstall = fake.commands(1).find(({ command }) => command.includes('pip install'));
+    expect(headInstall?.command).toContain('PIP_NO_INDEX=1 PIP_FIND_LINKS=/var/tmp/diffprove-packages/wheels');
+    expect(headInstall?.command).toContain('python3 -m venv .venv');
+    for (const vm of [0, 1]) {
+      expect(fake.commands(vm).at(-1)?.command).toBe(`export PATH="$PWD/.venv/bin:$PATH"; ${testCommand}`);
     }
   });
-}
 
-function createRequest(overrides: Partial<DifferentialRunRequest> = {}): DifferentialRunRequest {
-  return {
-    repoFullName: 'octocat/hello-world',
-    baseSha: 'base-sha',
-    headSha: 'head-sha',
-    tarball: TARBALL,
-    testOnlyDiff: 'test-only-patch-body',
-    fullDiff: 'full-patch-body',
-    testCommand: 'pytest "tests/test_a.py"',
-    installCommand: 'pip install -e . -r requirements.txt',
-    headInstallCommand: null,
-    runnerKind: 'pytest',
-    lockfileKey: 'lock-abc123',
-    ...overrides,
-  };
-}
-
-describe('createE2bDifferentialRunner', () => {
-  it('runs the cold (cache MISS) sequence in order and records a snapshot', async () => {
-    const { factory, calls, createCalls } = createFakeFactory();
-    const { cache, get, set } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    expect(timeline(calls)).toEqual([
-      'write /tmp/diffprove/base.tar.gz',
-      'write /tmp/diffprove/test-only.patch',
-      'write /tmp/diffprove/full.patch',
-      `run ${EXTRACT} (cwd=-, timeout=-)`,
-      `run pip install -e . -r requirements.txt (cwd=${WORKSPACE}, timeout=240000)`,
-      'snapshot diffprove-lock-abc123',
-      `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
-      `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
-      `run ${RELOCATE_RUN_A} (cwd=-, timeout=-)`,
-      `run ${RELOCATE_RUN_B} (cwd=-, timeout=-)`,
-      `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
-      `run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=${RUN_B}, timeout=30000)`,
-      'network denyAll=true',
-      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_A}, timeout=120000)`,
-      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_B}, timeout=120000)`,
-      'close',
-    ]);
-
-    // Defaults: 240s install + 120s test per run, doubled, plus 60s slack.
-    expect(createCalls).toEqual([
-      { templateId: undefined, apiKey: undefined, timeoutMs: 780_000 },
-    ]);
-    expect(get.mock.calls).toEqual([['octocat/hello-world', 'lock-abc123']]);
-    expect(set.mock.calls).toEqual([['octocat/hello-world', 'lock-abc123', 'snap-ref-1']]);
-    expect(result.runA).toEqual(ok());
-    expect(result.runB).toEqual(ok());
-
-    const writes = calls.filter(
-      (call): call is Extract<Call, { kind: 'writeFile' }> => call.kind === 'writeFile',
-    );
-    expect(writes.map((write) => write.path)).toEqual([
-      '/tmp/diffprove/base.tar.gz',
-      '/tmp/diffprove/test-only.patch',
-      '/tmp/diffprove/full.patch',
-    ]);
-    // The tarball is binary: it must arrive as bytes, not as a decoded string.
-    expect(writes[0]?.content).toBeInstanceOf(Uint8Array);
-    expect(Array.from(writes[0]?.content as Uint8Array)).toEqual(Array.from(TARBALL));
-    expect(writes[1]?.content).toBe('test-only-patch-body');
-    expect(writes[2]?.content).toBe('full-patch-body');
-  });
-
-  it('boots from the cached snapshot and rescues node_modules for node projects', async () => {
-    const { factory, calls, createCalls } = createFakeFactory();
-    const { cache, set } = createFakeCache({ value: 'snap-tpl' });
-    const { logger } = createLogger();
-    const request = createRequest({
-      runnerKind: 'vitest',
-      installCommand: 'npm ci',
-      testCommand: 'npx vitest run tests/a.test.ts',
-      lockfileKey: 'lock-node',
-    });
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    await runner(request);
-
-    expect(createCalls[0]?.templateId).toBe('snap-tpl');
-    expect(timeline(calls)).toEqual([
-      'write /tmp/diffprove/base.tar.gz',
-      'write /tmp/diffprove/test-only.patch',
-      'write /tmp/diffprove/full.patch',
-      `run mv ${WORKSPACE}/node_modules /tmp/diffprove/node_modules 2>/dev/null || true (cwd=-, timeout=-)`,
-      `run rm -rf ${WORKSPACE} && ${EXTRACT} (cwd=-, timeout=-)`,
-      `run mv /tmp/diffprove/node_modules ${WORKSPACE}/node_modules 2>/dev/null || true (cwd=-, timeout=-)`,
-      `run ${VERIFY_NODE_DEPS} (cwd=-, timeout=-)`,
-      `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
-      `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
-      `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
-      `run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=${RUN_B}, timeout=30000)`,
-      'network denyAll=true',
-      `run npx vitest run tests/a.test.ts (cwd=${RUN_A}, timeout=120000)`,
-      `run npx vitest run tests/a.test.ts (cwd=${RUN_B}, timeout=120000)`,
-      'close',
-    ]);
-
-    // A HIT already owns a valid environment: no install, no re-snapshot, no .venv relocation.
-    expect(runCalls(calls).map((call) => call.command)).not.toContain('npm ci');
-    expect(runCalls(calls).some((call) => call.command.includes('.venv'))).toBe(false);
-    expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
-    expect(set).not.toHaveBeenCalled();
-  });
-
-  it('boots from the cached snapshot and rescues .venv for pytest projects', async () => {
-    const { factory, calls, createCalls } = createFakeFactory();
-    const { cache, set } = createFakeCache({ value: 'snap-tpl' });
-    const { logger } = createLogger();
-    const request = createRequest({ lockfileKey: 'lock-py' });
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    await runner(request);
-
-    expect(createCalls[0]?.templateId).toBe('snap-tpl');
-    expect(timeline(calls)).toEqual([
-      'write /tmp/diffprove/base.tar.gz',
-      'write /tmp/diffprove/test-only.patch',
-      'write /tmp/diffprove/full.patch',
-      `run mv ${WORKSPACE}/.venv /tmp/diffprove/.venv 2>/dev/null || true (cwd=-, timeout=-)`,
-      `run rm -rf ${WORKSPACE} && ${EXTRACT} (cwd=-, timeout=-)`,
-      `run mv /tmp/diffprove/.venv ${WORKSPACE}/.venv 2>/dev/null || true (cwd=-, timeout=-)`,
-      `run ${VERIFY_PYTEST_DEPS} (cwd=-, timeout=-)`,
-      `run cp -a ${WORKSPACE} ${RUN_A} (cwd=-, timeout=-)`,
-      `run cp -a ${WORKSPACE} ${RUN_B} (cwd=-, timeout=-)`,
-      `run ${RELOCATE_RUN_A} (cwd=-, timeout=-)`,
-      `run ${RELOCATE_RUN_B} (cwd=-, timeout=-)`,
-      `run git apply --whitespace=nowarn /tmp/diffprove/test-only.patch (cwd=${RUN_A}, timeout=30000)`,
-      `run git apply --whitespace=nowarn /tmp/diffprove/full.patch (cwd=${RUN_B}, timeout=30000)`,
-      'network denyAll=true',
-      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_A}, timeout=120000)`,
-      `run ${PYTEST_TEST_COMMAND} (cwd=${RUN_B}, timeout=120000)`,
-      'close',
-    ]);
-    expect(
-      runCalls(calls).filter((call) => call.command.includes('node_modules')),
-    ).toHaveLength(0);
-    expect(runCalls(calls).map((call) => call.command)).not.toContain(
-      'pip install -e . -r requirements.txt',
-    );
-    expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
-    expect(set).not.toHaveBeenCalled();
-  });
-
-  it('aborts both runs when the base dependency install fails', async () => {
-    const installFailure: SandboxRawResult = {
-      exitCode: 2,
-      stdout: 'partial install output',
-      stderr: 'pip: no matching distribution',
-      timedOut: false,
-      durationMs: 4_321,
+  describe.each([
+    {
+      tool: 'uv',
+      command: '(command -v uv >/dev/null 2>&1 || pip install -q uv) && uv sync',
+    },
+    {
+      tool: 'poetry',
+      command: '(command -v poetry >/dev/null 2>&1 || pip install -q poetry) && POETRY_VIRTUALENVS_IN_PROJECT=true poetry install',
+    },
+  ])('$tool installer', ({ tool, command }) => {
+    const toolVenv = '/var/tmp/diffprove-packages/python-tools';
+    const installSuffix = ` && (${command})`;
+    const pythonRequest: DifferentialRunRequest = {
+      ...request,
+      runnerKind: 'pytest',
+      installCommand: command,
+      headInstallCommand: command,
+      testCommand: "pytest 'tests/test_a.py'",
     };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === 'pip install -e . -r requirements.txt' ? installFailure : ok()),
-    });
-    const { cache, set } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
 
-    const result = await runner(request);
+    it('retains bootstrap tooling for the seeded head and the next cached base, but not the project venv', async () => {
+      const fake = harness({ withCache: true });
+      await expect(fake.run(pythonRequest)).resolves.toEqual({ runA: ok, runB: ok });
+      await expect(fake.run(pythonRequest)).resolves.toEqual({ runA: ok, runB: ok });
+      expect(fake.creates().map(({ templateId, network }) => [templateId, network.mode])).toEqual([
+        ['default-template', 'registries'], ['snap-0', 'offline'], ['snap-0', 'offline'], ['snap-0', 'offline'],
+      ]);
 
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: 'partial install output',
-      stderr: 'dependency installation failed:\npip: no matching distribution',
-      timedOut: false,
-      durationMs: 4_321,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    expect(result.runA).not.toBe(result.runB);
-
-    const commands = runCalls(calls).map((call) => call.command);
-    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
-    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_B}`);
-    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
-    expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
-    expect(set).not.toHaveBeenCalled();
-    expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
-  });
-
-  it('aborts both runs when base workspace extraction fails', async () => {
-    const extractFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: '',
-      stderr: 'tar: Cannot open: Permission denied',
-      timedOut: false,
-      durationMs: 15,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === EXTRACT ? extractFailure : ok()),
-    });
-    const { cache, set } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: 'workspace extraction failed:\ntar: Cannot open: Permission denied',
-      timedOut: false,
-      durationMs: 15,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    expect(runCalls(calls).map((call) => call.command)).toEqual([EXTRACT]);
-    expect(calls.some((call) => call.kind === 'snapshot')).toBe(false);
-    expect(set).not.toHaveBeenCalled();
-    expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
-  });
-
-  it('aborts both runs when workspace copy fails', async () => {
-    const copyFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: '',
-      stderr: 'cp: cannot create directory',
-      timedOut: false,
-      durationMs: 22,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === `cp -a ${WORKSPACE} ${RUN_A}` ? copyFailure : ok()),
-    });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: 'run-a workspace copy failed:\ncp: cannot create directory',
-      timedOut: false,
-      durationMs: 22,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    const commands = runCalls(calls).map((call) => call.command);
-    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_B}`);
-    expect(commands.some((command) => command.includes('git apply'))).toBe(false);
-    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
-    expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
-  });
-
-  it('treats exitCode: null on a prep step as a failed step instead of continuing', async () => {
-    const sdkError: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: '[invalid_argument] cwd does not exist',
-      timedOut: false,
-      durationMs: 5,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === 'pip install -e . -r requirements.txt' ? sdkError : ok()),
-    });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: 'dependency installation failed:\n[invalid_argument] cwd does not exist',
-      timedOut: false,
-      durationMs: 5,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    const commands = runCalls(calls).map((call) => call.command);
-    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
-    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
-  });
-
-  it('aborts both runs if pytest .venv relocation fails', async () => {
-    const relocateFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: '',
-      stderr: 'python3: Permission denied',
-      timedOut: false,
-      durationMs: 11,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === RELOCATE_RUN_B ? relocateFailure : ok()),
-    });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: 'run-b .venv relocation failed:\npython3: Permission denied',
-      timedOut: false,
-      durationMs: 11,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    const commands = runCalls(calls).map((call) => call.command);
-    expect(commands.some((command) => command.includes('git apply'))).toBe(false);
-    expect(commands.some((command) => command.includes(request.testCommand))).toBe(false);
-  });
-
-  it('reports a test-only patch failure for Run A only, still testing Run B', async () => {
-    const patchFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: 'checking patch',
-      stderr: 'error: patch does not apply',
-      timedOut: false,
-      durationMs: 12,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command.includes('test-only.patch') ? patchFailure : ok()),
-    });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    expect(result.runA).toEqual({
-      exitCode: null,
-      stdout: 'checking patch',
-      stderr: 'test-only patch application failed:\nerror: patch does not apply',
-      timedOut: false,
-      durationMs: 12,
-    });
-    expect(result.runB).toEqual(ok());
-    const tests = runCalls(calls).filter((call) => call.command === PYTEST_TEST_COMMAND);
-    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_B]);
-  });
-
-  it('reports a full patch failure for Run B only, still testing Run A', async () => {
-    const patchFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: '',
-      stderr: 'error: corrupt patch at line 4',
-      timedOut: false,
-      durationMs: 9,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command.includes('full.patch') ? patchFailure : ok()),
-    });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    expect(result.runB).toEqual({
-      exitCode: null,
-      stdout: '',
-      stderr: 'full patch application failed:\nerror: corrupt patch at line 4',
-      timedOut: false,
-      durationMs: 9,
-    });
-    expect(result.runA).toEqual(ok());
-    const tests = runCalls(calls).filter((call) => call.command === PYTEST_TEST_COMMAND);
-    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_A]);
-  });
-
-  it('runs the head install inside run-b before the egress lockdown', async () => {
-    const { factory, calls } = createFakeFactory();
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest({
-      runnerKind: 'vitest',
-      installCommand: 'npm ci',
-      headInstallCommand: 'npm install --include=dev',
-      testCommand: 'npx vitest run tests/a.test.ts',
-    });
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    await runner(request);
-
-    const headInstallIndex = calls.findIndex(
-      (call) => call.kind === 'run' && call.command === 'npm install --include=dev',
-    );
-    const lockdownIndex = calls.findIndex((call) => call.kind === 'network');
-    expect(headInstallIndex).toBeGreaterThan(-1);
-    expect(lockdownIndex).toBeGreaterThan(headInstallIndex);
-    expect(runCalls(calls).find((call) => call.command === 'npm install --include=dev')?.opts).toEqual(
-      { cwd: RUN_B, timeoutMs: 240_000 },
-    );
-    // The network is still open for that install.
-    expect(calls[lockdownIndex]).toEqual({ kind: 'network', denyAll: true });
-  });
-
-  it('reports a head install failure for Run B only', async () => {
-    const headFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: 'head install output',
-      stderr: 'ERESOLVE unable to resolve dependency tree',
-      timedOut: false,
-      durationMs: 77,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) =>
-        command === 'npm install --include=dev' ? headFailure : ok(),
-    });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest({
-      runnerKind: 'vitest',
-      installCommand: 'npm ci',
-      headInstallCommand: 'npm install --include=dev',
-      testCommand: 'npx vitest run tests/a.test.ts',
-    });
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    expect(result.runB).toEqual({
-      exitCode: null,
-      stdout: 'head install output',
-      stderr: 'head dependency installation failed:\nERESOLVE unable to resolve dependency tree',
-      timedOut: false,
-      durationMs: 77,
-    });
-    expect(result.runA).toEqual(ok());
-    const tests = runCalls(calls).filter((call) => call.command === request.testCommand);
-    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_A]);
-  });
-
-  it('aborts both runs when egress lockdown is rejected', async () => {
-    const { factory, calls } = createFakeFactory({
-      onNetwork: (denyAll) => {
-        if (denyAll) {
-          throw new Error('egress api unavailable');
+      for (const vm of [0, 1, 2, 3]) {
+        const events = fake.forVm(vm);
+        const install = fake.commands(vm).find(({ command: cmd }) => cmd.endsWith(installSuffix));
+        expect(install?.opts).toEqual({ cwd: WORKSPACE, timeoutMs: 240_000 });
+        expect(install?.command).toContain(
+          `([ -x ${toolVenv}/bin/python ] || python3 -m venv ${toolVenv}) && export PATH="${toolVenv}/bin:$PATH"`,
+        );
+        expect(install?.command).not.toContain('VIRTUAL_ENV=');
+        const installIdx = events.findIndex((event) => event === install);
+        const denyIdx = events.findIndex(({ kind }) => kind === 'deny');
+        if (vm === 0) {
+          expect(install?.command).not.toContain('PIP_NO_INDEX');
+          expect(installIdx).toBeLessThan(denyIdx);
+          expect(denyIdx).toBeLessThan(events.findIndex(({ kind }) => kind === 'snapshot'));
+        } else {
+          const tree = vm === 2 ? 'base' : 'head';
+          const extraction = fake.commands(vm).find(({ command }) => command.includes('tar -xzf'));
+          expect(extraction?.command).toContain(
+            `rm -rf -- ${WORKSPACE} && mkdir -- ${WORKSPACE} && tar -xzf ${STAGING}/${tree}.tar.gz`,
+          );
+          expect(install?.command).toContain('PIP_NO_INDEX=1 PIP_FIND_LINKS=/var/tmp/diffprove-packages/wheels UV_OFFLINE=1');
+          expect(denyIdx).toBeLessThan(events.findIndex((event) => event === extraction));
+          expect(events.findIndex((event) => event === extraction)).toBeLessThan(installIdx);
         }
+        expect(fake.commands(vm).at(-1)?.command).toBe(
+          `export PATH="$PWD/.venv/bin:$PATH"; ${pythonRequest.testCommand}`,
+        );
+      }
+    });
+
+    it('boots a fresh offline head if the seed is rejected, even if the tool cannot be bootstrapped', async () => {
+      const pipError = `pip: no local distribution for ${tool}`;
+      const fake = harness({
+        onCreate: (vm) => { if (vm === 1) throw new Error('snapshot failed to boot'); },
+        onRun: (vm, command) => vm === 2 && command.endsWith(installSuffix) ? failed(pipError) : undefined,
+      });
+      await expect(fake.run(pythonRequest)).resolves.toEqual({
+        runA: ok,
+        runB: { ...ok, exitCode: null, stderr: `head dependency installation failed:\n${pipError}` },
+      });
+      expect(fake.creates().map(({ templateId, network }) => [templateId, network.mode])).toEqual([
+        ['default-template', 'registries'], ['snap-0', 'offline'], ['default-template', 'offline'],
+      ]);
+      expect(fake.forVm(2).map(({ kind }) => kind)).toEqual(['create', 'deny', 'write', 'run', 'run', 'close']);
+      const install = fake.commands(2).at(-1)?.command;
+      expect(install).toContain('PIP_NO_INDEX=1 PIP_FIND_LINKS=/var/tmp/diffprove-packages/wheels UV_OFFLINE=1');
+      expect(install).toContain(`pip install -q ${tool}`);
+    });
+  });
+
+  it('does not ask for registry access or a snapshot when no install is needed', async () => {
+    const fake = harness({ withCache: true });
+    await fake.run({ ...request, installCommand: null, headInstallCommand: null });
+    expect(fake.creates().map(({ network }) => network.mode)).toEqual(['offline', 'offline']);
+    expect(fake.cache.get).not.toHaveBeenCalled();
+    expect(fake.events.some(({ kind }) => kind === 'snapshot')).toBe(false);
+  });
+
+  it('collects native evidence in the same VM after each standard command, including a failing test', async () => {
+    const report = caseReportOptions('jest');
+    const testCommand = `${request.testCommand} ${report.args}`;
+    const fake = harness({
+      onRun: (vm, command) => {
+        if (command === testCommand && vm === 0) return failed('assertion failed');
+        if (command === report.readCommand) return {
+          ...ok,
+          stdout: JSON.stringify({
+            testResults: [{
+              name: `${WORKSPACE}/tests/a.test.js`,
+              assertionResults: [{
+                ancestorTitles: ['suite'], fullName: 'suite target', title: 'target',
+                status: vm === 0 ? 'failed' : 'passed',
+              }],
+            }],
+          }),
+        };
       },
     });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
+    const result = await fake.run({
+      ...request, installCommand: null, headInstallCommand: null, collectCaseResults: true,
     });
-
-    const result = await runner(request);
-
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: 'network egress lockdown failed: egress api unavailable',
-      timedOut: false,
-      durationMs: 0,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    expect(runCalls(calls).some((call) => call.command.includes(request.testCommand))).toBe(false);
-    expect(calls.filter((call) => call.kind === 'close')).toHaveLength(1);
+    expect(result.runA).toMatchObject({
+      ...failed('assertion failed'),
+      caseResults: [{ status: 'fail', id: expect.stringContaining('tests/a.test.js') }],
+    });
+    expect(result.runB.caseResults).toEqual([{ id: result.runA.caseResults?.[0]?.id, status: 'pass' }]);
+    for (const vm of [0, 1]) {
+      expect(fake.commands(vm).slice(-2)).toEqual([
+        { vm, kind: 'run', command: testCommand, opts: { cwd: WORKSPACE, timeoutMs: 120_000 } },
+        { vm, kind: 'run', command: report.readCommand, opts: { cwd: WORKSPACE, timeoutMs: 5_000 } },
+      ]);
+    }
   });
 
-  it('propagates sandbox creation failures and closes nothing', async () => {
-    const boom = new Error('sandbox create failed');
-    const { factory, calls } = createFakeFactory({ createError: boom });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    await expect(runner(createRequest())).rejects.toBe(boom);
-    expect(calls).toEqual([]);
+  it.each([
+    ['missing report', failed('not found')],
+    ['malformed report', { ...ok, stdout: 'not JSON' }],
+    ['timed-out report reader', timeout],
+  ] as const)('preserves raw results for a %s', async (_, readResult) => {
+    const { readCommand } = caseReportOptions('jest');
+    const fake = harness({ onRun: (_, command) => command === readCommand ? readResult : undefined });
+    await expect(fake.run({ ...request, collectCaseResults: true })).resolves.toEqual({ runA: ok, runB: ok });
   });
 
-  it('degrades a failing snapshot lookup to a cold run', async () => {
-    const { factory, calls, createCalls } = createFakeFactory();
-    const { cache, set } = createFakeCache({ getError: new Error('redis down') });
-    const { logger, warn } = createLogger();
-    const request = createRequest();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0]?.[0]).toContain('snapshot lookup failed');
-    expect(createCalls[0]?.templateId).toBeUndefined();
-    expect(runCalls(calls).map((call) => call.command)).toContain(
-      'pip install -e . -r requirements.txt',
-    );
-    expect(set.mock.calls).toEqual([['octocat/hello-world', 'lock-abc123', 'snap-ref-1']]);
-    expect(result.runA).toEqual(ok());
+  it('does not append flags or read a report for a custom command', async () => {
+    const { args, readCommand } = caseReportOptions('jest');
+    const fake = harness();
+    await expect(fake.run({
+      ...request, testCommand: 'custom-script', collectCaseResults: false,
+    })).resolves.toEqual({ runA: ok, runB: ok });
+    for (const vm of [0, 1]) {
+      expect(fake.commands(vm).at(-1)?.command).toBe('custom-script');
+      expect(fake.commands(vm).some(({ command }) => command.includes(args) || command === readCommand)).toBe(false);
+    }
   });
 
-  it('passes a timed-out test result through unchanged', async () => {
-    const timedOutRaw: SandboxRawResult = {
-      exitCode: null,
-      stdout: 'partial test output',
-      stderr: 'test timed out after 120000ms',
-      timedOut: true,
-      durationMs: 120_000,
-    };
-    const { factory } = createFakeFactory({
-      onRun: (command) => (command === PYTEST_TEST_COMMAND ? timedOutRaw : ok()),
+  it('does not read partial evidence after a test timeout', async () => {
+    const { args, readCommand } = caseReportOptions('jest');
+    const timedOutTest = harness({
+      onRun: (_, command) => command === `${request.testCommand} ${args}` ? timeout : undefined,
     });
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(createRequest());
-
-    expect(result.runA).toEqual(timedOutRaw);
-    expect(result.runB).toEqual(timedOutRaw);
+    await expect(timedOutTest.run({ ...request, collectCaseResults: true }))
+      .resolves.toEqual({ runA: timeout, runB: timeout });
+    expect(timedOutTest.events.some((event) => event.kind === 'run' && event.command === readCommand)).toBe(false);
   });
 
-  it('skips the cache write when snapshotting yields no reference', async () => {
-    const { factory, calls } = createFakeFactory({ onSnapshot: () => null });
-    const { cache, set } = createFakeCache();
-    const { logger } = createLogger();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
+  it('closes both handles even when a head upload throws a retriable infrastructure error', async () => {
+    const error = new Error('upload unreachable');
+    const fake = harness({
+      onWrite: (vm) => { if (vm === 1) throw error; },
+      onClose: () => { throw new Error('cleanup transport error'); },
     });
-
-    const result = await runner(createRequest());
-
-    expect(calls.some((call) => call.kind === 'snapshot')).toBe(true);
-    expect(set).not.toHaveBeenCalled();
-    expect(result.runA).toEqual(ok());
-  });
-
-  it('still resolves when closing the sandbox fails', async () => {
-    const { factory } = createFakeFactory({ closeError: new Error('kill failed') });
-    const { cache } = createFakeCache();
-    const { logger, warn } = createLogger();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    await expect(runner(createRequest())).resolves.toEqual({ runA: ok(), runB: ok() });
-    expect(warn.mock.calls.map(([message]) => message)).toContain(
-      'failed to close E2B sandbox: kill failed',
-    );
-  });
-
-  it('runs jest testCommand directly without .venv PATH wrapping or .venv relocation', async () => {
-    const { factory, calls } = createFakeFactory();
-    const { cache } = createFakeCache();
-    const { logger } = createLogger();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    await runner(
-      createRequest({
-        runnerKind: 'jest',
-        installCommand: 'npm ci',
-        testCommand: 'npx jest tests/a.test.js',
-      }),
-    );
-
-    const tests = runCalls(calls).filter((call) => call.command === 'npx jest tests/a.test.js');
-    expect(tests.map((call) => call.opts?.cwd)).toEqual([RUN_A, RUN_B]);
-    expect(runCalls(calls).some((call) => call.command.includes('.venv'))).toBe(false);
-  });
-
-  it('aborts both runs when cached workspace reset extraction fails', async () => {
-    const resetFailure: SandboxRawResult = {
-      exitCode: 1,
-      stdout: '',
-      stderr: 'tar: unexpected EOF',
-      timedOut: false,
-      durationMs: 14,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === `rm -rf ${WORKSPACE} && ${EXTRACT}` ? resetFailure : ok()),
-    });
-    const { cache } = createFakeCache({ value: 'snap-tpl' });
-    const { logger } = createLogger();
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(createRequest());
-
-    const expected: SandboxRawResult = {
-      exitCode: null,
-      stdout: '',
-      stderr: 'workspace extraction failed:\ntar: unexpected EOF',
-      timedOut: false,
-      durationMs: 14,
-    };
-    expect(result.runA).toEqual(expected);
-    expect(result.runB).toEqual(expected);
-    const commands = runCalls(calls).map((call) => call.command);
-    expect(commands).not.toContain(`cp -a ${WORKSPACE} ${RUN_A}`);
-    expect(commands.some((command) => command.includes(PYTEST_TEST_COMMAND))).toBe(false);
-  });
-
-  it('reinstalls dependencies and refreshes the snapshot when a cached snapshot is missing deps', async () => {
-    const missingDeps: SandboxRawResult = {
-      exitCode: 1,
-      stdout: '',
-      stderr: '',
-      timedOut: false,
-      durationMs: 2,
-    };
-    const { factory, calls } = createFakeFactory({
-      onRun: (command) => (command === VERIFY_PYTEST_DEPS ? missingDeps : ok()),
-    });
-    const { cache, set } = createFakeCache({ value: 'stale-empty-snap' });
-    const { logger, warn } = createLogger();
-    const request = createRequest({ lockfileKey: 'lock-py' });
-    const runner = createE2bDifferentialRunner({
-      sandboxFactory: factory,
-      snapshotCache: cache,
-      logger,
-    });
-
-    const result = await runner(request);
-
-    expect(result.runA).toEqual(ok());
-    expect(result.runB).toEqual(ok());
-    expect(warn).toHaveBeenCalledWith(
-      'cached environment snapshot for octocat/hello-world (lock-py) is missing dependencies; reinstalling',
-    );
-    expect(runCalls(calls).map((call) => call.command)).toContain(request.installCommand);
-    expect(set.mock.calls).toEqual([['octocat/hello-world', 'lock-py', 'snap-ref-1']]);
+    await expect(fake.run({ ...request, headInstallCommand: null })).rejects.toBe(error);
+    expect(fake.closed()).toEqual([0, 1]);
+    expect(fake.logger.warn).toHaveBeenCalledTimes(2);
   });
 });

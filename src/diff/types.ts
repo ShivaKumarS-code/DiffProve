@@ -9,7 +9,8 @@
  * Scope (docs/architecture.md, "End-to-End Verification Pipeline", step 2):
  * fetch the unified PR diff, split it into the Test-Only Patch and the Full
  * PR Patch using test-file globs, and short-circuit PRs with no test changes
- * to a `neutral` check run. Sandbox execution of the two patches is Phase 3.
+ * to a `neutral` check run. Only the test patch is applied during verification;
+ * the second run uses the archived PR head.
  */
 
 /** File-level change classification, derived from the diff section headers. */
@@ -94,22 +95,27 @@ export interface PrDiffRequest {
 }
 
 /**
- * Port: fetches the raw unified diff of `base...head` for a pull request.
+ * Port: fetches the raw unified diff of `base...head` and the merge base
+ * against which it was computed.
  *
  * Implemented by `src/github/pulls.ts` against the GitHub compare endpoint
- * with the `.diff` media type (sha-pinned so later pushes to the PR cannot
- * change what a job verifies); faked in unit tests with canned diffs.
+ * with JSON and `.diff` media types (sha-pinned so later pushes to the PR
+ * cannot change what a job verifies); faked in unit tests with canned diffs.
  */
-export type PrDiffClient = (request: PrDiffRequest) => Promise<string>;
+export type PrDiffClient = (
+  request: PrDiffRequest,
+) => Promise<{ diff: string; mergeBaseSha: string }>;
 
 /** Check-run output title for the pure-refactor short-circuit (pipeline step 2). */
 export const NO_TEST_CHANGES_TITLE = 'No test changes detected to verify';
 
-/** Input for the no-test-changes short-circuit report on a PR head commit. */
+/** Input for a neutral skip report on a PR head commit. */
 export interface NoTestChangesReport {
   repoFullName: string;
   headSha: string;
   installationId: number;
+  /** Exact check run to complete; legacy jobs may omit it. */
+  checkRunId?: number;
   /** Check run output title, e.g. "No test changes detected to verify". */
   title: string;
   /** Check run output summary explaining the skip. */
@@ -118,9 +124,8 @@ export interface NoTestChangesReport {
 
 /**
  * Port: completes the DiffProve check run as `neutral` for a PR head commit.
- * Finds the queued run created in Phase 1 and PATCHes it to
- * `completed`/`neutral`; if none exists yet, POSTs a new completed/neutral
- * run. Implemented by `src/github/check-runs.ts`; faked in unit tests.
+ * Completes the specified check run when its ID is known.
+ * Implemented by `src/github/check-runs.ts`; faked in unit tests.
  */
 export interface CheckRunReporter {
   reportNoTestChanges(report: NoTestChangesReport): Promise<void>;

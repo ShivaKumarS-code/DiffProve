@@ -1,13 +1,10 @@
-# Registering the DiffProve GitHub App (Phase 1)
+# Registering the DiffProve GitHub App
 
 DiffProve is a GitHub App. GitHub posts pull-request and installation events to
-`POST /webhooks/github`; Phase 1 verifies the `X-Hub-Signature-256` HMAC, posts a `queued`
-Check Run, and enqueues a verification job in BullMQ. This guide takes you from a fresh GitHub
-account to a local server doing all three, including a signed smoke test you can run before any
-real webhook arrives.
-
-Phase 1 is ingestion only: the worker is log-only and the check run stays `queued`. Sandbox
-execution is Phase 3 (`docs/architecture.md`, heading **"MVP Build Phases"**).
+`POST /webhooks/github`. The server verifies the `X-Hub-Signature-256` HMAC and durably enqueues
+PR verification jobs in BullMQ. After claiming a job, the worker creates or recovers the check
+on the PR head, runs the comparison when available, and completes that exact check. This guide
+covers both a local signed `ping` and live PR smoke tests.
 
 ---
 
@@ -15,16 +12,16 @@ execution is Phase 3 (`docs/architecture.md`, heading **"MVP Build Phases"**).
 
 ### Prerequisites
 
-- A checkout of this repository. Phase 1 code is developed on the
-  `feature/phase-1-webhook-ingestion` branch and merged to `main` once the phase is verified.
+- A checkout of this repository.
 - **Node.js 20 or newer** (`node -v`). The repo declares `"engines": { "node": ">=20" }`, and
   `npm install` installs everything else.
 - A GitHub account that can create GitHub Apps (your personal account, or an organization
   where you are an owner).
 - A **public HTTPS URL** that forwards to your machine. GitHub will not call
   `http://localhost`. Use ngrok or cloudflared (Step 1.3).
-- Optional: **Docker**, for Redis via `docker compose up -d redis`. Any Redis 6+ works.
-  Without Redis the server still starts, but webhook handling that enqueues a job fails.
+- **Redis** for the live PR test (Docker Compose or a managed instance). The local signed `ping`
+  does not use Redis, but PR enqueue fails without it.
+- **E2B API key** for executing tests. Optional: **PostgreSQL** for dashboard run history.
 - Optional: `openssl` (preinstalled on macOS/Linux and in Git Bash) for the bash smoke test.
 
 ### What you will end up with
@@ -34,8 +31,8 @@ execution is Phase 3 (`docs/architecture.md`, heading **"MVP Build Phases"**).
 | GitHub App | App ID, a webhook secret, and a downloaded `.pem` private key |
 | `.env` | `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`, `REDIS_URL` |
 | Local server | `POST /webhooks/github` on `PORT` (default `3000`) |
-| Check run on a PR | `DiffProve: Differential Verification`, status `queued` |
-| Queue | A BullMQ job per supported `pull_request` action, consumed by the log-only worker |
+| Check run on a PR | `DiffProve: Differential Verification`, created or recovered by the worker and completed with a conclusion |
+| Queue | A durable BullMQ verification job for each supported PR revision |
 
 ---
 
@@ -58,20 +55,20 @@ ID and the private-key button only exist after the app is created.
 | **GitHub App name** | `DiffProve (dev)`. Names are unique across all of GitHub; if it is taken, add your handle or org, e.g. `DiffProve (dev, acme)`. This is the name on the installation page, not the check-run name — the check run is fixed in code as `DiffProve: Differential Verification`. |
 | **Description** | Optional, one line: `Differential PR verification for AI-authored and human tests.` |
 | **Homepage URL** | Required. Your repository URL, e.g. `https://github.com/<you>/diffprove`, or the tunnel root. |
-| **Identifying and authorizing users** (Callback URL, "Request user authorization during installation") | Leave the callback URL blank and the toggle off. Phase 1 has no OAuth user flow. |
-| **Post installation** (Setup URL, "Redirect on update") | Leave blank. There is no post-install redirect in Phase 1. |
+| **Identifying and authorizing users** (Callback URL, "Request user authorization during installation") | Leave the toggle off. For webhook-only setup, leave the callback URL blank; for dashboard login, use `<dashboard-origin>/api/auth/callback` and configure OAuth in Step 2. |
+| **Post installation** (Setup URL, "Redirect on update") | Leave blank. |
 | **Webhook → Active** | Checked. |
 | **Webhook URL** | `https://<your-public-host>/webhooks/github`. The path is fixed in the server; do not use `/` or `/webhook`. See 1.3 for getting a public host locally. |
 | **Webhook secret** | A strong random value you generate now. It becomes `GITHUB_WEBHOOK_SECRET`. GitHub stores it and only shows dots afterwards, so record it before saving. Commands: `openssl rand -hex 32` (bash/macOS/Linux/Git Bash), or PowerShell below. |
 | **Webhook → Content type** | `application/json` (not `application/x-www-form-urlencoded`). The server verifies the HMAC over the raw JSON body and parses that body as JSON, so form encoding breaks both. |
 | **SSL verification** | **Enable** (the default). Your tunnel serves HTTPS. |
-| **Repository permissions → Checks** | **Read and write**. Required to create the `queued` check run (and, in Phase 3/4, to update it with output). |
-| **Repository permissions → Contents** | **Read-only**. Used from Phase 2 onward to fetch PR diffs and file contents. Phase 1 does not read contents, but granting it now avoids a re-install later. |
+| **Repository permissions → Checks** | **Read and write**. Required for the worker to find, create and update check runs. |
+| **Repository permissions → Contents** | **Read-only**. Required to fetch the pinned comparison and source archives. |
 | **Repository permissions → Pull requests** | **Read-only**. Gives the app read access to PR data for the `pull_request` payload; the **Pull request** event subscription below is what makes GitHub deliver the webhook. |
 | **Repository permissions → Metadata** | **Read-only**, implicit and always granted. It cannot be deselected. |
 | **Organization permissions** | Leave all at **No access**. |
 | **Account permissions** | Leave all at **No access**. |
-| **Subscribe to events** | Check **Pull request** and **Installation**. (`Installation repositories` is a separate event; Phase 1 does not need it.) |
+| **Subscribe to events** | Check **Pull request** and **Installation**. `Installation repositories` is a separate event and is not needed for this walkthrough. |
 | **Where can this GitHub App be installed?** | **Only on this account** for development. The manifest sets `public: false` to match. |
 
 Click **Create GitHub App**.
@@ -136,7 +133,7 @@ Notes:
 
 The app settings page header shows **App ID: 123456**. That numeric value is `GITHUB_APP_ID`
 (also the `iss` of the App JWT used to mint installation tokens). The **Client ID** next to it is
-for OAuth and is not used in Phase 1.
+used only when configuring dashboard OAuth.
 
 ### 1.5 Generate and download the private key
 
@@ -198,7 +195,7 @@ cp .env.example .env
 Copy-Item .env.example .env
 ```
 
-Then set these values (the template lists exactly these names):
+Set these values for webhook intake:
 
 ```dotenv
 PORT=3000
@@ -217,6 +214,12 @@ GITHUB_PRIVATE_KEY=replace-with-the-base64-or-pem-value
 | `REDIS_URL` | `redis://127.0.0.1:6379` (default) | Fine with `docker compose up -d redis`, or any Redis 6+. |
 | `PORT` | `3000` (default) | Must match the tunnel target. |
 | `LOG_LEVEL` | `info` (default) | Raise to `debug` if you are chasing a routing problem. |
+
+Set `E2B_API_KEY` for the weak/valid test smoke runs. To see run history and edit per-repo
+settings, start PostgreSQL (`docker compose up -d postgres`) and set `DATABASE_URL`. When
+enabling dashboard sign-in, also set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`,
+`SESSION_SECRET`, and `PUBLIC_URL` to match the dashboard origin used for the OAuth callback.
+See [`.env.example`](../.env.example) for the full configuration.
 
 ### `GITHUB_PRIVATE_KEY`
 
@@ -304,21 +307,23 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/healthz
 ```
 
 Leave the server running. Start Redis before Step 5: without it, enqueue attempts fail (`500`
-from webhook handling) and the queue clients log connection retries. Start it now so the log is
-clean:
+from webhook handling). The health endpoint does not verify Redis, GitHub or E2B:
 
 ```bash
 docker compose up -d redis
 ```
+
+To check the dashboard too, copy `apps/web/.env.example` to `apps/web/.env.local` and run
+`npm run dev:web` in a separate terminal. Use the origin printed by Next.js for `PUBLIC_URL`
+and the OAuth callback if you enabled sign-in.
 
 ---
 
 ## Step 4 — Local smoke test: send a signed `ping`
 
 GitHub sends a `ping` event when an app with an active webhook is created. Reproducing it
-locally exercises the whole Phase 1 intake path — raw-body HMAC verification, JSON parsing, and
-event routing — without a pull request or a repository. A correctly signed request returns
-**HTTP 200** with a body containing `pong`.
+locally exercises raw-body HMAC verification, JSON parsing and event routing without touching
+the queue. A correctly signed request returns **HTTP 200** with a body containing `pong`.
 
 Rules for both snippets:
 
@@ -430,14 +435,14 @@ If you get `401`, the signature and the bytes/secret disagree — see Troublesho
 
 1. On the app's settings page, choose **Install App** in the left sidebar.
 2. Pick the account, then **Only select repositories** and select a test repository (ideally one
-   with a `package.json` or `pyproject.toml`, since Phase 2/3 will need a known test runner).
+   with a supported test runner and lockfile on its base branch).
 3. Click **Install**.
 
 This sends an `installation` webhook with action `created`; the server acknowledges it with
-`200` and logs it. Installation events do not create check runs or queue jobs in Phase 1.
+`200`, logs it, and records it when PostgreSQL is configured. Installation events do not create
+check runs or queue jobs.
 
-Without an installation there is no installation token, so posting a check run fails. If you add
-repositories later, GitHub sends `installation_repositories` (not subscribed in Phase 1).
+Without an installation, the App cannot mint an installation token for the repository.
 
 ### 5.2 Open or update a pull request
 
@@ -446,22 +451,34 @@ PR from a branch, or push a new commit to an existing PR (a `synchronize` delive
 closed PR. GitHub sends `pull_request` for each of these; only `opened`, `synchronize`, and
 `reopened` are acted on.
 
+For live verification, follow [the Render smoke fixtures](deploy-render.md#4-smoke-test) to
+open two PRs: a weak test that passes on both sides, and a valid regression test that fails by
+assertion on the merge base plus the test patch and passes on the exact head. Keep dependencies
+unchanged and available offline from the image, local files or a trusted base cache. The head
+starts offline, so a cold cache or missing dependency can prevent the tests from running.
+Public sandbox ports are disabled. For an optional third PR, add both types of case in the
+same changed test file to smoke-test the mixed verdict.
+
+If E2B reports `snapshot_filesystem_only_disabled`, enable filesystem-only snapshots and use
+a compatible template and envd, or provide dependencies through a trusted prewarmed template
+or vendored artifacts. The runner does not fall back to memory snapshots.
+
 ### 5.3 What you should see
 
-1. **Within a few seconds**, the PR's **Checks** tab (or "Show all checks") lists
-   **`DiffProve: Differential Verification`** with status **Queued**. It is attached to the PR's
-   head commit, so refresh and look at the latest commit if you force-pushed.
-2. The terminal running `npm run dev` logs the delivery and the job id
-   `verify~<owner>~<repo>~<pr-number>~<head-sha>`; the worker then logs
-   `verification job received: repo=… pr=… head=… (Phase 1 log-only handler)`. That is the whole
-   of Phase 1's execution.
-3. Redis holds the job, and the Compose service's AOF persistence means it survives a restart.
-   Nothing is written to PostgreSQL.
-4. The check run **stays queued**. Phase 1 only posts the queued state; Phase 3 runs the tests
-   and Phase 4 reports the verdict. A permanently-queued check run is the expected Phase 1
-   behavior, not a bug.
-5. Redelivering the same webhook is safe: the deterministic job id (`verify~…`) means a retry
-   does not duplicate the job.
+1. GitHub's delivery details show **HTTP 202** once the job is enqueued. The PR's **Checks**
+   tab shows **`DiffProve: Differential Verification`** on the exact delivered head SHA after
+   the worker claims the job. Check creation need not be visible when the webhook returns.
+2. A weak PR completes with `failure` (**Weak test**, pass/pass). A valid PR completes with
+   `success` (**Verified fix**, fail/pass). With PostgreSQL configured, both comparisons should
+   appear in the dashboard; supported native runners also report cases from the targeted changed
+   test files, not an inventory of every edited case.
+3. A PR without test changes, a disabled repository, or an unavailable runner completes with a
+   neutral check rather than staying queued. After verification retries are exhausted, a separate
+   durable BullMQ job retries neutral check delivery with a bounded number of attempts without
+   rerunning the tests.
+4. To verify recovery, manually redeliver the original event. The job identity is stable, and
+   the worker uses a stable GitHub `external_id` and the persisted check ID to recover the same
+   check when possible. Confirm this in the live environment; a local `ping` does not test it.
 
 To see queued jobs in Redis (BullMQ prefixes its keys with `bull:` by default):
 
@@ -474,13 +491,13 @@ docker compose exec redis redis-cli --scan --pattern 'bull:*' | head
 | Incoming request | Server response | Side effects |
 | --- | --- | --- |
 | `ping` | `200` `{"message":"pong"}` | None (logged). |
-| `pull_request` action `opened`, `synchronize`, `reopened` | `202` | Queued check run + BullMQ job. |
+| `pull_request` action `opened`, `synchronize`, `reopened` | `202` | Durable BullMQ job; the worker owns the check lifecycle. |
 | Any other `pull_request` action (`edited`, `closed`, `labeled`, …) | `200` | Ignored (logged). |
 | `pull_request` without installation context | `200` | Ignored with a warning; no job or check run. |
 | Malformed payload for a subscribed event | `400` | Rejected; nothing enqueued. |
-| `installation` (`created`, `deleted`, `new_permissions_accepted`, `suspend`, `unsuspend`) | `200` | Acknowledged and logged; no job. |
+| `installation` (`created`, `deleted`, `new_permissions_accepted`, `suspend`, `unsuspend`) | `200` | Acknowledged and logged; applicable actions update PostgreSQL when configured. No job. |
 | Missing or wrong `X-Hub-Signature-256` | `401` | Nothing enqueued. |
-| Signature valid but enqueue or check-run posting fails | `500` | GitHub retries; the deterministic job id keeps retries idempotent. |
+| Signature valid but enqueue fails | `500` | Fix the queue connection, then manually redeliver from GitHub. |
 
 ---
 
@@ -509,9 +526,17 @@ update `.env`, restart the server, then redeliver the failed delivery.
 
 ### No check run appears
 
-The webhook most likely never reached the server. Open the app settings page →
+First check whether the webhook reached the server. Open the app settings page →
 **Advanced → Recent Deliveries**: each row shows the event, action, HTTP status, and the response
-body GitHub received. A failed delivery is redelivered with **Redeliver** once the cause is fixed.
+body GitHub received. GitHub does not automatically retry failed webhook deliveries. Fix the
+cause, open the failed delivery and click **Redeliver**. If the response was `202`, inspect
+the worker and its GitHub API errors; webhook acknowledgement does not confirm check delivery.
+
+GitHub and Redis cannot update atomically. If a verification job stalls, terminal reporting
+depends on the fallback being able to enqueue finalization. If the handoff fails or the
+finalization job exhausts its own retries, inspect both the Redis jobs and the check on the
+exact PR head before intervening. Stable identifiers limit duplicate work but do not promise
+exactly-once check delivery.
 
 Other common causes:
 
@@ -539,7 +564,8 @@ webhook handling mean Redis is not reachable:
 - Check `REDIS_URL` for a wrong host, port, or missing password; if port `6379` is already taken
   by another Redis, either use that one or remap the Compose port and update the URL.
 - A managed Redis usually needs its TLS URL (`rediss://…`) and credentials.
-- Enqueue failures surface as `500` so GitHub retries; starting Redis and redelivering is safe.
+- For a `500` enqueue failure, restore Redis, then manually redeliver the failed webhook as
+  described above. Worker retries after a successful enqueue are separate from webhook delivery.
 
 ### Other symptoms
 
@@ -550,7 +576,8 @@ webhook handling mean Redis is not reachable:
 | `403 Resource not accessible by integration` when posting a check run | **Checks** permission is not read/write, or the app is not installed on the repo | Fix the permission, accept it on the installation, re-run. |
 | `404` from the tunnel / an HTML page instead of JSON | Wrong path (`/webhook` vs `/webhooks/github`), wrong port, or the tunnel points somewhere else | Fix the Webhook URL and redeliver. |
 | `502` / `ERR_NGROK_3200` | The tunnel is down or the local server is not running | Restart the server, then the tunnel; update the URL if the hostname changed. |
-| Check run appears but never progresses | Expected in Phase 1 | Sandbox execution and verdict reporting arrive in Phases 3–4. |
+| Check run appears but never progresses | Worker stopped, retries are pending, or terminal delivery failed | Inspect worker logs, Redis job state and GitHub permissions/API errors. Verify the status on the exact PR head. |
+| Neutral sandbox/environment result during a valid smoke PR | E2B unavailable or dependencies could not be set up offline | Check E2B credentials, the template and trusted base cache. A neutral result is not a verified fix. |
 
 ---
 
@@ -567,27 +594,10 @@ webhook handling mean Redis is not reachable:
 
 ---
 
-## Scope note: no PostgreSQL in Phase 1
-
-Phase 1 deliberately does **not** persist installations, repositories, or run history.
-`docs/architecture.md` schedules those tables (heading **"Core Data Model"** →
-**"PostgreSQL Tables"**: `installations`, `repositories`, `verification_runs`) for the database
-phase. Until then, installation state lives in GitHub itself, job state lives in Redis, and the
-worker only logs each job. The dashboard endpoints (`GET /api/repos/:id/runs`,
-`PATCH /api/repos/:id/config`) are Phase 4 and do not exist yet.
-
-By phase:
-
-| Phase | Adds | Not yet |
-| --- | --- | --- |
-| 1 (this guide) | App registration, HMAC verification, `queued` check run, BullMQ job | Diff parsing, sandbox runs, persistence |
-| 2 | Diff splitter (test hunks vs implementation hunks) | Sandbox execution |
-| 3 | E2B Run A / Run B, network egress disabled during tests | Historical queries |
-| 4 | Verdict check runs, dashboard, config UI | — |
-
 ## Related files
 
-- [`docs/architecture.md`](architecture.md) — system design and the Phase 1 scope line.
+- [`docs/architecture.md`](architecture.md) — system design and check lifecycle.
+- [`docs/deploy-render.md`](deploy-render.md) — deployment and weak/valid live smoke fixtures.
 - [`PLAN.md`](../PLAN.md) — current execution plan and shared contracts.
 - [`.env.example`](../.env.example) — the environment-variable template used in Step 2.
 - [`.github/app-manifest.json`](../.github/app-manifest.json) — optional manifest for Step 1.6.

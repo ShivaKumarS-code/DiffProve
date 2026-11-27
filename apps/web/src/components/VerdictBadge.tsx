@@ -3,11 +3,11 @@
 /**
  * Verdict indicator for a verification run in the ledger.
  *
- * The five verdict ids are the differential matrix's outcomes
+ * The verdict ids are the differential matrix's outcomes
  * (docs/architecture.md, "End-to-End Verification Pipeline", step 6). Colours
- * follow the matrix's check-run semantics: a verified fix is emerald, weak and
- * broken outcomes are amber/red, a new-symbol addition is neutral-blue, and an
- * environment failure is slate because no verdict about the PR exists.
+ * follow the matrix's check-run semantics: a verified fix is emerald; weak,
+ * mixed, and broken outcomes are amber/orange/red; a new-symbol addition is
+ * neutral-blue; environment failure is slate because no PR verdict exists.
  *
  * Unknown verdicts (a newer service, a failed run) still render, slate with the
  * raw string, so the dashboard never hides a record it does not understand.
@@ -23,14 +23,20 @@ const VERDICT_STYLES: Record<string, VerdictStyle> = {
   'verified-fix': {
     label: 'Verified fix',
     description:
-      'The changed tests fail on the base commit and pass on the PR head, so they verify the change.',
+      'The changed tests fail on the merge base with the test patch and pass on the exact PR head.',
     className: 'border-emerald-400/35 bg-emerald-500/15 text-emerald-200',
   },
   'weak-test': {
     label: 'Weak test',
     description:
-      'The changed tests pass on both the base commit and the PR head, so they cannot verify the change.',
+      'The changed tests pass on both the patched merge base and the exact PR head, so they do not verify the change.',
     className: 'border-amber-400/35 bg-amber-500/15 text-amber-200',
+  },
+  'mixed-test': {
+    label: 'Mixed test evidence',
+    description:
+      'Some cases fail on the merge base and pass on the PR head; others pass on both. The GitHub check fails.',
+    className: 'border-orange-400/35 bg-orange-500/15 text-orange-200',
   },
   'broken-implementation': {
     label: 'Broken implementation',

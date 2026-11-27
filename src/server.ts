@@ -7,9 +7,8 @@
  * can be tested without any of it.
  *
  * Phase 1-4 scope (architecture, "End-to-End Verification Pipeline" steps 1-6):
- * accept verified webhooks, post a `queued` check run, split each PR's diff,
- * run the differential (Run A base + Test-Only Patch, Run B head + Full PR
- * Patch) in an E2B sandbox with egress locked down, complete the check run
+ * enqueue verified webhooks, recover or post a `queued` check on worker claim,
+ * split each PR's diff, run the differential in E2B, complete the check run
  * with the rich Markdown verdict report, and persist runs + repo config to
  * PostgreSQL for the dashboard. PRs without test changes short-circuit to
  * `neutral` as before.
@@ -26,7 +25,7 @@ import { createPgPool } from './db/pool.js';
 import { createRepoConfigLookup, createRepositoryStore } from './db/repositories.js';
 import type { InstallationStore, RepositoryStore, VerificationRunStore } from './db/types.js';
 import { createVerificationRunStore } from './db/verification-runs.js';
-import { createCheckRunPoster } from './github/checks.js';
+import { createVerificationChecks } from './github/checks.js';
 import { createCheckRunReporter } from './github/check-runs.js';
 import { createAppAuthenticator, createOctokit } from './github/octokit.js';
 import { createPrDiffClient } from './github/pulls.js';
@@ -88,11 +87,11 @@ async function main(): Promise<void> {
   const repoConfig = repositories === null ? null : createRepoConfigLookup(repositories);
 
   // One shared auth-less transport + authenticator backs every GitHub call:
-  // the queued-check-run poster, the diff/report clients, and the Phase 3
+  // the check lifecycle, the diff/report clients, and the Phase 3
   // repo-content, tarball, and verdict reporters.
   const octokit = createOctokit();
   const authenticator = createAppAuthenticator(config.githubAppId, config.githubPrivateKey);
-  const checkPoster = createCheckRunPoster(octokit, authenticator);
+  const checks = createVerificationChecks(octokit, authenticator, Number(config.githubAppId));
 
   const auth: AuthDeps | null =
     config.githubClientId !== null &&
@@ -111,7 +110,6 @@ async function main(): Promise<void> {
   const app = buildApp({
     webhookSecret: config.webhookSecret,
     enqueuer,
-    checkPoster,
     logLevel: config.logLevel,
     api: repositories !== null && runsStore !== null ? { repositories, runs: runsStore } : null,
     installations: installationStore,
@@ -119,8 +117,8 @@ async function main(): Promise<void> {
   });
 
   // Phase 3 differential runner. Without an E2B_API_KEY there is no sandbox, so
-  // the runner port is null: the handler logs a warning per job and leaves the
-  // check run queued instead of pretending a verification happened.
+  // the runner port is null: the handler reports a neutral skip for test changes
+  // instead of pretending a verification happened.
   const e2bApiKey = config.e2bApiKey;
   const snapshotKv = e2bApiKey === null ? null : createRedisKeyValueStore(config.redisUrl);
   const runner =
@@ -151,7 +149,7 @@ async function main(): Promise<void> {
       verdicts: createVerdictReporter(octokit, authenticator),
       logger: app.log,
     }),
-    { logger: app.log },
+    { checks, logger: app.log },
   );
 
   await app.listen({ port: config.port, host: '0.0.0.0' });

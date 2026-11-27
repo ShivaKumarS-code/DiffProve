@@ -8,6 +8,7 @@
  * satisfiable and the repo's language/installation linkage stays current.
  */
 
+import type { CaseEvidence } from '../runner/case-evidence.js';
 import type { DbPool } from './pool.js';
 import type {
   RepositoryStore,
@@ -31,6 +32,7 @@ type VerificationRunDbRow = {
   duration_ms: number;
   run_a_log: string;
   run_b_log: string;
+  case_evidence: unknown;
   created_at: Date;
 };
 
@@ -38,12 +40,9 @@ type VerificationRunDbRow = {
 type RunAggregateDbRow = {
   total_runs: number;
   weak_test_count: number;
+  mixed_test_count: number;
 };
 
-/**
- * The SQL run columns in contract order; kept in one place so the select and
- * the insert cannot drift apart.
- */
 const RUN_COLUMNS = `id,
        repository_id,
        pr_number,
@@ -56,7 +55,53 @@ const RUN_COLUMNS = `id,
        duration_ms,
        run_a_log,
        run_b_log,
+       case_evidence,
        created_at`;
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+type CaseEntry = CaseEvidence['cases'][number];
+
+function isCaseStatus(value: unknown): value is CaseEntry['base'] {
+  return value === 'pass' || value === 'fail' || value === 'skipped' || value === 'unknown';
+}
+
+/** JSONB is not schema-typed: invalid optional evidence must not hide the run. */
+function decodeCaseEvidence(value: unknown): CaseEvidence | null {
+  if (!isJsonObject(value)) {
+    return null;
+  }
+  const { reproducing, nonReproducing, totalCases, cases } = value;
+  if (
+    !isCount(reproducing) ||
+    !isCount(nonReproducing) ||
+    !isCount(totalCases) ||
+    reproducing + nonReproducing > totalCases ||
+    !Array.isArray(cases) ||
+    cases.length > totalCases
+  ) {
+    return null;
+  }
+
+  const decoded: CaseEntry[] = [];
+  for (const entry of cases as unknown[]) {
+    if (!isJsonObject(entry)) {
+      return null;
+    }
+    const { id, base, head } = entry;
+    if (typeof id !== 'string' || id.length === 0 || !isCaseStatus(base) || !isCaseStatus(head)) {
+      return null;
+    }
+    decoded.push({ id, base, head });
+  }
+  return { reproducing, nonReproducing, totalCases, cases: decoded };
+}
 
 /** Maps a snake_case database row onto the camelCase contract. */
 function mapRun(row: VerificationRunDbRow): VerificationRunRow {
@@ -73,6 +118,7 @@ function mapRun(row: VerificationRunDbRow): VerificationRunRow {
     durationMs: row.duration_ms,
     runALog: row.run_a_log,
     runBLog: row.run_b_log,
+    caseEvidence: decodeCaseEvidence(row.case_evidence),
     createdAt: row.created_at,
   };
 }
@@ -94,8 +140,8 @@ export function createVerificationRunStore(
       await pool.query(
         `insert into verification_runs (
            repository_id, pr_number, base_sha, head_sha, changed_test_files,
-           run_a_status, run_b_status, verdict, duration_ms, run_a_log, run_b_log
-         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           run_a_status, run_b_status, verdict, duration_ms, run_a_log, run_b_log, case_evidence
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
          on conflict (repository_id, pr_number, base_sha, head_sha) do update set
            changed_test_files = excluded.changed_test_files,
            run_a_status = excluded.run_a_status,
@@ -104,6 +150,7 @@ export function createVerificationRunStore(
            duration_ms = excluded.duration_ms,
            run_a_log = excluded.run_a_log,
            run_b_log = excluded.run_b_log,
+           case_evidence = excluded.case_evidence,
            created_at = now()`,
         [
           repository.id,
@@ -117,6 +164,7 @@ export function createVerificationRunStore(
           run.durationMs,
           run.runALog,
           run.runBLog,
+          run.caseEvidence == null ? null : JSON.stringify(run.caseEvidence),
         ],
       );
     },
@@ -136,7 +184,8 @@ export function createVerificationRunStore(
       const aggregateRows = await pool.query<RunAggregateDbRow>(
         `select
            count(*)::int as total_runs,
-           (count(*) filter (where verdict = 'weak-test'))::int as weak_test_count
+           (count(*) filter (where verdict = 'weak-test'))::int as weak_test_count,
+           (count(*) filter (where verdict = 'mixed-test'))::int as mixed_test_count
          from verification_runs
          where repository_id = $1`,
         [repositoryId],
@@ -151,6 +200,7 @@ export function createVerificationRunStore(
         runs: rows.map(mapRun),
         totalRuns,
         weakTestCount,
+        mixedTestCount: aggregateRows[0]?.mixed_test_count ?? 0,
         catchRate,
       };
     },

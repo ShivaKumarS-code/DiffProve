@@ -44,6 +44,16 @@ export interface RepoRow {
   createdAt: string;
 }
 
+type CaseStatus = 'pass' | 'fail' | 'skipped' | 'unknown';
+
+export interface CaseEvidence {
+  reproducing: number;
+  nonReproducing: number;
+  totalCases: number;
+  /** A bounded preview, not necessarily all cases counted in the totals. */
+  cases: { id: string; base: CaseStatus; head: CaseStatus }[];
+}
+
 /** A row from the `verification_runs` table, as serialised by the API. */
 export interface RunRow {
   id: string;
@@ -58,6 +68,7 @@ export interface RunRow {
   durationMs: number;
   runALog: string;
   runBLog: string;
+  caseEvidence: CaseEvidence | null;
   createdAt: string;
 }
 
@@ -67,7 +78,9 @@ export interface RunHistorySummary {
   runs: RunRow[];
   totalRuns: number;
   weakTestCount: number;
-  /** Fraction of runs flagged `weak-test`; `null` when there are no runs yet. */
+  /** Whole-history count; null when talking to an older service. */
+  mixedTestCount: number | null;
+  /** Fraction flagged `weak-test` (not `mixed-test`); null when no runs exist. */
   catchRate: number | null;
 }
 
@@ -101,6 +114,11 @@ const BAD_GATEWAY_STATUS = 502;
 
 /** Reported when the request never reached the service (DNS, refused, CORS). */
 const UNREACHABLE_STATUS = 0;
+
+const MAX_CASE_PREVIEW = 20;
+const MAX_CASE_LABEL_LENGTH = 240;
+/** The service currently stores at most 100 entries; allow some version skew. */
+const MAX_CASE_ENTRIES = 200;
 
 /**
  * Every failed API call surfaces as this error. `status` is the HTTP status, or
@@ -264,6 +282,67 @@ function parseRepoRow(value: unknown): RepoRow {
   };
 }
 
+function isCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isCaseStatus(value: unknown): value is CaseStatus {
+  return value === 'pass' || value === 'fail' || value === 'skipped' || value === 'unknown';
+}
+
+function selectCasePreview(cases: CaseEvidence['cases']): CaseEvidence['cases'] {
+  if (cases.length <= MAX_CASE_PREVIEW) {
+    return cases;
+  }
+
+  // Reserve one representative of each transition, then fill in original order.
+  const selected = new Set<number>();
+  for (const base of ['fail', 'pass'] as const) {
+    const index = cases.findIndex((row) => row.base === base && row.head === 'pass');
+    if (index !== -1) {
+      selected.add(index);
+    }
+  }
+  for (let index = 0; selected.size < MAX_CASE_PREVIEW; index += 1) {
+    selected.add(index);
+  }
+  return cases.filter((_, index) => selected.has(index));
+}
+
+/** Older or malformed optional evidence should never break the history page. */
+function parseCaseEvidence(value: unknown): CaseEvidence | null {
+  if (!isJsonObject(value)) {
+    return null;
+  }
+  const { reproducing, nonReproducing, totalCases, cases } = value;
+  if (
+    !isCount(reproducing) ||
+    !isCount(nonReproducing) ||
+    !isCount(totalCases) ||
+    reproducing + nonReproducing > totalCases ||
+    !isUnknownArray(cases) ||
+    cases.length > totalCases ||
+    cases.length > MAX_CASE_ENTRIES
+  ) {
+    return null;
+  }
+
+  const decoded: CaseEvidence['cases'] = [];
+  for (const item of cases) {
+    if (!isJsonObject(item)) {
+      return null;
+    }
+    const { id, base, head } = item;
+    if (typeof id !== 'string' || id.length === 0 || !isCaseStatus(base) || !isCaseStatus(head)) {
+      return null;
+    }
+    const label =
+      id.length > MAX_CASE_LABEL_LENGTH ? `${id.slice(0, MAX_CASE_LABEL_LENGTH - 1)}…` : id;
+    decoded.push({ id: label, base, head });
+  }
+  return { reproducing, nonReproducing, totalCases, cases: selectCasePreview(decoded) };
+}
+
 function parseRunRow(value: unknown): RunRow {
   const source = requireObject(value, 'verification run');
   return {
@@ -279,6 +358,7 @@ function parseRunRow(value: unknown): RunRow {
     durationMs: readNumber(source, 'durationMs'),
     runALog: readString(source, 'runALog'),
     runBLog: readString(source, 'runBLog'),
+    caseEvidence: parseCaseEvidence(source['caseEvidence']),
     createdAt: readString(source, 'createdAt'),
   };
 }
@@ -375,12 +455,14 @@ export async function getRepos(): Promise<RepoRow[]> {
 export async function getRepoRuns(id: string, limit = 50): Promise<RepoRunsResponse> {
   const path = `/api/repos/${encodeURIComponent(id)}/runs?limit=${String(limit)}`;
   const body = requireObject(await requestJson(path), 'run history');
+  const mixedTestCount = body['mixedTestCount'];
 
   return {
     repository: parseRepoRow(body['repository']),
     runs: requireArray(body, 'runs').map(parseRunRow),
     totalRuns: readNumber(body, 'totalRuns'),
     weakTestCount: readNumber(body, 'weakTestCount'),
+    mixedTestCount: isCount(mixedTestCount) ? mixedTestCount : null,
     catchRate: readNullableNumber(body, 'catchRate'),
   };
 }
